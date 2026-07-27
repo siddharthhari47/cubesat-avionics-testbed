@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# STM32CubeIDE / Eclipse CDT
+Debug/
+Release/
+.metadata/
+*.launch
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+
+# KiCad backups/locks
+*-bak
+*.kicad_pcb-bak
+*.kicad_sch-bak
+fp-info-cache
+*.lck
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
