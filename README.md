@@ -1,13 +1,21 @@
 # CubeSat-Inspired Avionics & Mission Control Testbed
 
-A benchtop spacecraft avionics testbed — not flight hardware. No vibration, thermal,
-or EMI qualification.
-
 **Status: V0, Week 1 — repository scaffolding only. No firmware, no simulator, no
 requirements written yet.**
 
-Mission statement, system requirements, and architecture diagrams are the next
-deliverables and will replace this section as they're written.
+## Mission
+
+This project is a benchtop, CubeSat-inspired avionics testbed built to demonstrate the
+full chain of spacecraft flight-computer functions on the bench: acquiring real sensor
+data, packaging it into structured telemetry, streaming it to a ground-station
+dashboard, executing telecommands sent back from the operator, logging mission data,
+and autonomously detecting and responding to faults through a dedicated SAFE mode. It
+is not flight hardware — there is no vibration, thermal, or EMI qualification — and its
+purpose is to produce a verifiable, requirements-driven engineering artifact rather
+than a working demo alone.
+
+System requirements and architecture diagrams are the next deliverables and will
+replace this note as they're written.
 
 ## Repository layout
 
