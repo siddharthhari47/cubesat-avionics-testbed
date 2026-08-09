@@ -1,0 +1,19 @@
+{
+  "master_seed": 0,
+  "dt_s": 0.1,
+  "episode_duration_s": 60.0,
+  "fault_onset_s": 20.0,
+  "fault_clear_s": 45.0,
+  "nominal_episodes": 40,
+  "fault_episodes_per_type": 15,
+  "fault_types": [
+    "sensor_timeout",
+    "sensor_lockup",
+    "undervoltage",
+    "gradual_drift",
+    "thermal"
+  ],
+  "total_episodes": 115,
+  "total_samples": 69000,
+  "generated_at_unix_s_placeholder": 1786304613.5075164
+}

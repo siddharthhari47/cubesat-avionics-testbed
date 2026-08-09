@@ -30,6 +30,17 @@ written. Immediate deliverables in order:
 
 Hardware is ordered only after V0 works.
 
+## Engineering phases
+
+Layered under the V0-V4 version roadmap below, the software-side work itself
+follows Phase 0 (define: requirements, interfaces, architecture) then Phase 1
+(build the software, ML, and FDIR foundation, before hardware arrives). Phase
+2 is deliberately undefined -- it depends on what Phase 1 actually teaches
+once finished, not a plan drafted in advance.
+`docs/architecture/phase0-1-engineering-decisions.md` is the canonical record
+of why the `fdir/` extraction and the ML architecture decisions were made;
+read it before re-deriving them from git history or first principles.
+
 ## Version roadmap
 
 | Version | Scope |
@@ -88,6 +99,7 @@ engineering. If a doc describes something not yet built, mark it clearly as plan
 firmware/           STM32 embedded C/C++
 ground-station/     Python mission-control application
 simulator/          V0 synthetic telemetry generator
+fdir/               Deterministic FDIR decision engine, hardware-agnostic (no sockets/threads)
 hardware/           Schematics, KiCad files, photographs
 docs/requirements/  SRS, traceability matrix
 docs/architecture/  Block diagrams, mode state machines

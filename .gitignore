@@ -36,3 +36,8 @@ Thumbs.db
 # default; commit specific runs deliberately (git add -f) when they're real
 # verification evidence (V3), not on every casual test run.
 data/*.csv
+
+# Generated ML datasets are large (tens of MB) and fully reproducible from
+# simulator/dataset_gen.py's fixed seed -- keep the small manifest (it's the
+# audit trail), not the CSV itself.
+data/datasets/*.csv
