@@ -34,6 +34,8 @@ class FaultFlag(IntFlag):
     ADAPTIVE_ANOMALY = 1 << 5
     ML_ANOMALY = 1 << 6
     WATCHDOG_RESET = 1 << 7
+    THERMAL_ANOMALY = 1 << 8
+    SENSOR_LOCKUP = 1 << 9
 
 
 class HealthFlag(IntFlag):

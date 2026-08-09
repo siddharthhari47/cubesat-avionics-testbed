@@ -69,7 +69,9 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 5 | Adaptive-baseline anomaly | FDIR-006 |
 | 6 | ML anomaly *(reserved, FDIR-007 not yet implemented)* | FDIR-007 |
 | 7 | Last reset was watchdog-triggered | — |
-| 8-15 | Reserved | — |
+| 8 | Thermal anomaly | FDIR-009 |
+| 9 | Sensor lockup (stuck/frozen reading, distinct from timeout) | FDIR-010 |
+| 10-15 | Reserved | — |
 
 ## Health Flag Bits (offset 11, uint8 bitmask)
 

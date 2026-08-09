@@ -1,213 +1,103 @@
 """
-V0 flight-computer simulator.
+V0/V1-prep flight-computer simulator.
 
 Stands in for the STM32 flight computer (docs/architecture/block-diagram.md).
-Implements the BOOT/NOMINAL/SAFE/TEST state machine (docs/architecture/mode-diagram.md),
-generates synthetic telemetry (docs/interfaces/telemetry-dictionary.md), and handles
-commands (docs/interfaces/command-dictionary.md) over a local TCP socket standing in
-for a real UART/radio link.
+This module is now a thin server/adapter: SpacecraftEnvironment (environment.py)
+generates sensor physics and owns fault-injection ground truth; FDIREngine
+(fdir/engine.py) owns the BOOT/NOMINAL/SAFE/TEST state machine and all fault
+detection; this file just wires them to a TCP socket standing in for a real
+UART/radio link, tracks link-level bookkeeping (sequence numbers, command
+counters), and dispatches commands that don't touch FDIR state (PING,
+GET_STATUS, SET_TELEMETRY_RATE, REQUEST_LOG).
 
-Fault injection happens at THIS process's own stdin, not over the ground-station link
--- that link is the real spacecraft interface; stdin here plays the role of a test
-engineer physically doing something to the hardware (unplugging a sensor, etc).
+Fault injection happens at THIS process's own stdin, not over the ground-station
+link -- that link is the real spacecraft interface; stdin here plays the role of
+a test engineer physically doing something to the hardware.
 
-Run: python simulator/run_simulator.py
-Then, at this process's prompt: fault sensor | fault undervoltage | fault drift |
-fault clear | reboot | status | quit
+Run: python simulator/run_simulator.py [--seed N]
+Then, at this process's prompt:
+  fault sensor_timeout | sensor_lockup | undervoltage | gradual_drift | thermal | clear
+  reboot | status | quit
 """
 
 import argparse
-import random
 import socket
 import sys
 import threading
 import time
+from pathlib import Path
 
-from protocol import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from fdir.engine import FDIREngine, MLAdvisory  # noqa: E402
+
+from environment import SpacecraftEnvironment, FAULT_TYPES  # noqa: E402
+from protocol import (  # noqa: E402
     AckPacket, AckStatus, CommandId, CommandPacket, FaultFlag, HealthFlag, Mode,
     TelemetryPacket, read_packet,
 )
 
-BOOT_DURATION_S = 2.0               # SYS-003 target: <=5s
-SENSOR_TIMEOUT_DEBOUNCE_S = 0.05    # FDIR-002
-UNDERVOLTAGE_DEBOUNCE_S = 0.10      # FDIR-003
-ADAPTIVE_DEBOUNCE_SAMPLES = 3       # FDIR-006
-MIN_ADAPTIVE_SAMPLES = 20           # warm-up before the baseline is trusted to judge anything
-COMMS_LOSS_TIMEOUT_S = 5.0          # COM-003
-
-NOMINAL_VOLTAGE = 5.0
-UNDERVOLTAGE_INJECTED_VOLTAGE = 3.8     # below the 4.0V critical threshold -> FDIR-003
-DRIFT_INJECTED_VOLTAGE = 4.3            # below normal but ABOVE critical -- demonstrates
-                                         # FDIR-006 catching what FDIR-003's fixed
-                                         # threshold alone would miss
-EWMA_ALPHA = 0.1
-ADAPTIVE_K = 4.0    # flag if |x - mean| exceeds this many standard deviations
-
-
-class EwmaStat:
-    """Exponentially-weighted mean/variance -- the 'adaptive baseline' behind FDIR-006."""
-
-    def __init__(self, alpha):
-        self.alpha = alpha
-        self.mean = None
-        self.var = 0.0
-
-    def update(self, x):
-        if self.mean is None:
-            self.mean = x
-            return
-        delta = x - self.mean
-        self.mean += self.alpha * delta
-        self.var = (1 - self.alpha) * (self.var + self.alpha * delta * delta)
-
-    def deviation_sigma(self, x):
-        if self.mean is None or self.var <= 0:
-            return 0.0
-        return abs(x - self.mean) / (self.var ** 0.5)
-
 
 class Simulator:
-    def __init__(self, telemetry_rate_hz):
+    def __init__(self, telemetry_rate_hz: float, seed=None):
         self.lock = threading.Lock()
-        self.mode = Mode.BOOT
-        self.boot_time = time.monotonic()
+        self.env = SpacecraftEnvironment(seed=seed)
+        self.engine = FDIREngine()
+        self.boot_time = time.monotonic()      # for the wire timestamp_ms field only
         self.process_start = time.monotonic()
         self.seq_num = 0
         self.telemetry_rate_hz = telemetry_rate_hz
-        self.fault_flags = FaultFlag.NONE
-        self.health_flags = HealthFlag.ALL_OK
         self.cmd_rx_count = 0
         self.cmd_accept_count = 0
         self.cmd_reject_count = 0
         self.corrupted_rx_count = 0
 
-        # Injected "physical" fault conditions -- what a test engineer would actually
-        # do to real hardware, stood in for via stdin commands (see module docstring).
-        self.injected_sensor_timeout = False
-        self.injected_undervoltage = False
-        self.injected_drift = False
-
-        self._sensor_timeout_since = None
-        self._undervoltage_since = None
-        self._adaptive_breach_count = 0
-        self._adaptive_sample_count = 0
-        self.voltage_baseline = EwmaStat(EWMA_ALPHA)
-
         self.conn_lock = threading.Lock()
         self.conn = None
         self.last_client_seen = None
 
-    # ---- mode/fault machine -------------------------------------------------
+    # ---- tick: environment -> FDIR -> wire packet -------------------------------------------------
 
-    def tick(self):
+    def tick(self) -> TelemetryPacket:
         with self.lock:
             now = time.monotonic()
-
-            if self.mode == Mode.BOOT and now - self.boot_time >= BOOT_DURATION_S:
-                self.mode = Mode.SAFE if self.fault_flags else Mode.NOMINAL
-
-            self._update_sensor_timeout(now)
-            self._update_undervoltage(now)
+            sample, _truth = self.env.step(1.0 / self.telemetry_rate_hz)
+            # ml_advisory=None until ml/ produces one at V1+; the hook already
+            # exists end to end (see fdir/engine.py's SAFE_MODE_TRIGGER_FLAGS).
+            self.engine.tick(sample, now, ml_advisory=None)
             self._update_comms_loss(now)
-
-            sample = self._generate_sample()
-            self._update_adaptive_baseline(sample["bus_voltage_v"])
-
-            if self.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL and self.mode in (Mode.NOMINAL, Mode.TEST):
-                self.mode = Mode.SAFE
-
             return self._build_packet(sample)
 
-    def _update_sensor_timeout(self, now):
-        # health_flags reflects live status; fault_flags LATCHES until RESET_FAULTS
-        # (see _apply_command) -- that's the whole point of the command existing.
-        if self.injected_sensor_timeout:
-            self.health_flags &= ~HealthFlag.IMU_OK
-            if self._sensor_timeout_since is None:
-                self._sensor_timeout_since = now
-            elif now - self._sensor_timeout_since >= SENSOR_TIMEOUT_DEBOUNCE_S:
-                self.fault_flags |= FaultFlag.SENSOR_TIMEOUT
-        else:
-            self.health_flags |= HealthFlag.IMU_OK
-            self._sensor_timeout_since = None
-
-    def _update_undervoltage(self, now):
-        if self.injected_undervoltage:
-            if self._undervoltage_since is None:
-                self._undervoltage_since = now
-            elif now - self._undervoltage_since >= UNDERVOLTAGE_DEBOUNCE_S:
-                self.fault_flags |= FaultFlag.UNDERVOLTAGE_CRITICAL
-        else:
-            self._undervoltage_since = None
-
     def _update_comms_loss(self, now):
-        # Unlike the latched faults above, this one is a live "are we connected right
-        # now" indicator -- there's no operator-side condition to confirm before
-        # clearing it, reconnecting IS the recovery.
+        # Link-level, not a fault about the spacecraft's own state -- stays
+        # here rather than in fdir/engine.py, which has no concept of sockets.
+        # BOOT guard matters: "no client connected yet" is normal during boot,
+        # not a fault -- the same class of cold-start false positive as the
+        # adaptive-baseline and lockup detectors, dropped once already during
+        # this refactor and now put back deliberately.
+        if self.engine.mode == Mode.BOOT:
+            return
         with self.conn_lock:
             connected = self.conn is not None
-        if self.mode == Mode.BOOT:
-            return
-        if not connected and (self.last_client_seen is None or now - self.last_client_seen >= COMMS_LOSS_TIMEOUT_S):
-            self.fault_flags |= FaultFlag.COMMS_LOSS
-        elif connected:
-            self.fault_flags &= ~FaultFlag.COMMS_LOSS
+            last_seen = self.last_client_seen
+        if connected:
+            self.engine.fault_flags &= ~FaultFlag.COMMS_LOSS
+        elif last_seen is None or now - last_seen >= 5.0:
+            self.engine.fault_flags |= FaultFlag.COMMS_LOSS
 
-    def _update_adaptive_baseline(self, voltage):
-        # FDIR isn't fully active until NOMINAL, and -- the important part -- a
-        # variance estimate built from only a handful of samples is nearly zero,
-        # which makes ordinary noise look like a huge number of standard deviations
-        # away. Require a warm-up period before the baseline is trusted to judge
-        # anything; this is what stops the detector from flagging itself on cold start.
-        if self.mode == Mode.BOOT:
-            return
-        if self.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
-            return  # don't let an active fault get learned as the new normal
-
-        warmed_up = self._adaptive_sample_count >= MIN_ADAPTIVE_SAMPLES
-        if warmed_up and self.voltage_baseline.deviation_sigma(voltage) > ADAPTIVE_K:
-            self._adaptive_breach_count += 1
-            if self._adaptive_breach_count >= ADAPTIVE_DEBOUNCE_SAMPLES:
-                self.fault_flags |= FaultFlag.ADAPTIVE_ANOMALY
-        else:
-            self._adaptive_breach_count = 0
-            self.voltage_baseline.update(voltage)
-            self._adaptive_sample_count += 1
-
-    # ---- telemetry generation -------------------------------------------------
-
-    def _generate_sample(self):
-        voltage = NOMINAL_VOLTAGE + random.gauss(0, 0.02)
-        if self.injected_undervoltage:
-            voltage = UNDERVOLTAGE_INJECTED_VOLTAGE + random.gauss(0, 0.02)
-        elif self.injected_drift:
-            voltage = DRIFT_INJECTED_VOLTAGE + random.gauss(0, 0.02)
-
-        return {
-            "temp_c": 25.0 + random.gauss(0, 0.3),
-            "accel_x": random.gauss(0, 0.01),
-            "accel_y": random.gauss(0, 0.01),
-            "accel_z": 1.0 + random.gauss(0, 0.01),
-            "gyro_x": random.gauss(0, 0.5),
-            "gyro_y": random.gauss(0, 0.5),
-            "gyro_z": random.gauss(0, 0.5),
-            "mag_x": 25.0 + random.gauss(0, 1.0),
-            "mag_y": -8.0 + random.gauss(0, 1.0),
-            "mag_z": 40.0 + random.gauss(0, 1.0),
-            "bus_voltage_v": voltage,
-            "bus_current_a": 0.4 + random.gauss(0, 0.02),
-        }
-
-    def _build_packet(self, sample):
+    def _build_packet(self, sample) -> TelemetryPacket:
         self.seq_num = (self.seq_num + 1) % 65536
         timestamp_ms = int((time.monotonic() - self.boot_time) * 1000) % (2**32)
         uptime_s = int(time.monotonic() - self.process_start)
         return TelemetryPacket(
-            seq_num=self.seq_num, timestamp_ms=timestamp_ms, mode=int(self.mode),
-            fault_flags=int(self.fault_flags), health_flags=int(self.health_flags),
+            seq_num=self.seq_num, timestamp_ms=timestamp_ms, mode=int(self.engine.mode),
+            fault_flags=int(self.engine.fault_flags), health_flags=int(self.engine.health_flags),
+            temp_c=sample.temp_c, accel_x=sample.accel_x, accel_y=sample.accel_y, accel_z=sample.accel_z,
+            gyro_x=sample.gyro_x, gyro_y=sample.gyro_y, gyro_z=sample.gyro_z,
+            mag_x=sample.mag_x, mag_y=sample.mag_y, mag_z=sample.mag_z,
+            bus_voltage_v=sample.bus_voltage_v, bus_current_a=sample.bus_current_a,
             uptime_s=uptime_s, cmd_rx_count=self.cmd_rx_count,
             cmd_accept_count=self.cmd_accept_count, cmd_reject_count=self.cmd_reject_count,
-            corrupted_rx_count=self.corrupted_rx_count, **sample,
+            corrupted_rx_count=self.corrupted_rx_count,
         )
 
     # ---- command handling -------------------------------------------------
@@ -215,14 +105,15 @@ class Simulator:
     def handle_command(self, cmd: CommandPacket) -> AckPacket:
         with self.lock:
             self.cmd_rx_count += 1
-            status = self._apply_command(cmd)
+            now = time.monotonic()
+            status = self._apply_command(cmd, now)
             if status == AckStatus.ACCEPTED:
                 self.cmd_accept_count += 1
             else:
                 self.cmd_reject_count += 1
             return AckPacket(seq_num=cmd.seq_num, cmd_id=cmd.cmd_id, status=status)
 
-    def _apply_command(self, cmd: CommandPacket) -> int:
+    def _apply_command(self, cmd: CommandPacket, now: float) -> int:
         if cmd.cmd_id in (CommandId.PING, CommandId.GET_STATUS):
             return AckStatus.ACCEPTED
 
@@ -233,75 +124,59 @@ class Simulator:
             return AckStatus.REJECTED_INVALID_PARAM
 
         if cmd.cmd_id == CommandId.ENTER_SAFE_MODE:
-            self.mode = Mode.SAFE
+            self.engine.enter_safe_mode(now)
             return AckStatus.ACCEPTED
 
         if cmd.cmd_id == CommandId.EXIT_SAFE_MODE:
-            if self.mode != Mode.SAFE:
-                return AckStatus.ACCEPTED
-            if self.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
-                return AckStatus.REJECTED_SAFE_MODE_FAULT_ACTIVE
-            self.mode = Mode.NOMINAL
-            return AckStatus.ACCEPTED
+            accepted = self.engine.exit_safe_mode(now)
+            return AckStatus.ACCEPTED if accepted else AckStatus.REJECTED_SAFE_MODE_FAULT_ACTIVE
 
         if cmd.cmd_id == CommandId.RESET_FAULTS:
-            if not self.injected_sensor_timeout:
-                self.fault_flags &= ~FaultFlag.SENSOR_TIMEOUT
-            if not self.injected_undervoltage:
-                self.fault_flags &= ~FaultFlag.UNDERVOLTAGE_CRITICAL
-            if not self.injected_drift:
-                self.fault_flags &= ~FaultFlag.ADAPTIVE_ANOMALY
-            self.fault_flags &= ~(FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET)
+            self.engine.reset_faults(now)
             return AckStatus.ACCEPTED
 
         if cmd.cmd_id == CommandId.REQUEST_LOG:
             return AckStatus.REJECTED_NOT_IMPLEMENTED  # no SD logging until V2
 
         if cmd.cmd_id == CommandId.ENABLE:
-            if self.mode not in (Mode.NOMINAL, Mode.TEST):
-                return AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
-            self.mode = Mode.TEST
-            return AckStatus.ACCEPTED
+            return AckStatus.ACCEPTED if self.engine.enter_test_mode() else AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
 
         if cmd.cmd_id == CommandId.DISABLE:
-            if self.mode != Mode.TEST:
-                return AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
-            self.mode = Mode.NOMINAL
-            return AckStatus.ACCEPTED
+            return AckStatus.ACCEPTED if self.engine.exit_test_mode() else AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
 
         return AckStatus.REJECTED_UNKNOWN_CMD
 
     # ---- fault injection (stdin) -------------------------------------------------
 
-    def inject(self, name):
+    def inject(self, name: str) -> None:
         with self.lock:
-            if name == "sensor":
-                self.injected_sensor_timeout = not self.injected_sensor_timeout
-                print(f"[sim] sensor timeout injection: {self.injected_sensor_timeout}")
-            elif name == "undervoltage":
-                self.injected_undervoltage = not self.injected_undervoltage
-                print(f"[sim] undervoltage injection: {self.injected_undervoltage}")
-            elif name == "drift":
-                self.injected_drift = not self.injected_drift
-                print(f"[sim] voltage drift injection: {self.injected_drift}")
-            elif name == "clear":
-                self.injected_sensor_timeout = False
-                self.injected_undervoltage = False
-                self.injected_drift = False
+            if name == "clear":
+                self.env.clear_all()
                 print("[sim] all injected conditions cleared (fault flags still need RESET_FAULTS)")
-            elif name == "reboot":
-                self.mode = Mode.BOOT
-                self.boot_time = time.monotonic()
-                self.seq_num = 0
-                self.fault_flags |= FaultFlag.WATCHDOG_RESET
-                print("[sim] simulated watchdog reset -> BOOT")
+            elif name in FAULT_TYPES:
+                self.env.inject(name)
+                print(f"[sim] injected: {name}")
+            elif name.startswith("clear "):
+                target = name.split(" ", 1)[1]
+                self.env.clear(target)
+                print(f"[sim] cleared: {target}")
             else:
-                print(f"[sim] unknown fault name: {name!r}")
+                print(f"[sim] unknown fault name: {name!r} (options: {', '.join(FAULT_TYPES)})")
 
-    def status_line(self):
+    def reboot(self) -> None:
         with self.lock:
-            return (f"mode={Mode(self.mode).name} faults={FaultFlag(self.fault_flags)!r} "
-                    f"health={HealthFlag(self.health_flags)!r} rate={self.telemetry_rate_hz}Hz")
+            now = time.monotonic()
+            self.boot_time = now
+            self.seq_num = 0
+            self.engine.watchdog_reset(now)
+            print("[sim] simulated watchdog reset -> BOOT")
+
+    def status_line(self) -> str:
+        with self.lock:
+            e = self.engine
+            return (f"mode={Mode(e.mode).name} faults={FaultFlag(e.fault_flags)!r} "
+                    f"health={HealthFlag(e.health_flags)!r} rate={self.telemetry_rate_hz}Hz "
+                    f"env_active={self.env.active_faults()}")
 
 
 def client_handler(sim: Simulator, conn: socket.socket, addr):
@@ -325,7 +200,7 @@ def client_handler(sim: Simulator, conn: socket.socket, addr):
             if corrupted:
                 with sim.lock:
                     sim.corrupted_rx_count += 1
-                    sim.fault_flags |= FaultFlag.CORRUPTED_PACKET
+                    sim.engine.fault_flags |= FaultFlag.CORRUPTED_PACKET
             if packet is None:
                 break
             if not isinstance(packet, CommandPacket):
@@ -357,7 +232,7 @@ def telemetry_loop(sim: Simulator, stop_event: threading.Event):
 
 
 def stdin_loop(sim: Simulator, stop_event: threading.Event):
-    print("[sim] commands: fault sensor|undervoltage|drift|clear, reboot, status, quit")
+    print("[sim] commands: fault <" + "|".join(FAULT_TYPES) + "|clear>, reboot, status, quit")
     for line in sys.stdin:
         cmd = line.strip().lower()
         if not cmd:
@@ -370,18 +245,19 @@ def stdin_loop(sim: Simulator, stop_event: threading.Event):
         elif cmd.startswith("fault "):
             sim.inject(cmd.split(" ", 1)[1])
         elif cmd == "reboot":
-            sim.inject("reboot")
+            sim.reboot()
         else:
             print(f"[sim] unknown command: {cmd!r}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="V0 CubeSAT flight-computer simulator")
+    parser = argparse.ArgumentParser(description="CubeSAT flight-computer simulator")
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--rate", type=float, default=1.0, help="initial telemetry rate, Hz")
+    parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible runs")
     args = parser.parse_args()
 
-    sim = Simulator(telemetry_rate_hz=args.rate)
+    sim = Simulator(telemetry_rate_hz=args.rate, seed=args.seed)
     stop_event = threading.Event()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -389,7 +265,7 @@ def main():
     server.bind(("127.0.0.1", args.port))
     server.listen(1)
     server.settimeout(0.5)
-    print(f"[sim] listening on 127.0.0.1:{args.port}")
+    print(f"[sim] listening on 127.0.0.1:{args.port}" + (f" (seed={args.seed})" if args.seed is not None else ""))
 
     threading.Thread(target=telemetry_loop, args=(sim, stop_event), daemon=True).start()
     threading.Thread(target=stdin_loop, args=(sim, stop_event), daemon=True).start()
