@@ -84,6 +84,7 @@ def evaluate_fault_type(fault_type, episodes, model):
 
     fdir_latencies, ml_latencies = [], []
     fdir_detected, ml_detected = 0, 0
+    ml_flagged_samples, fault_active_samples = 0, 0
 
     for ep_df in episodes:
         fdir_rows = run_fdir_over_episode(ep_df, expected_flag)
@@ -101,6 +102,18 @@ def evaluate_fault_type(fault_type, episodes, model):
             ml_detected += 1
             ml_latencies.append(t_ml - FAULT_ONSET_S)
 
+        # Per-SAMPLE rate, not just per-episode. Episode-level recall alone is
+        # badly misleading here: with ~250 fault-active samples per episode and
+        # a threshold that flags ~1% of in-distribution samples by construction
+        # (contamination), "at least one flag somewhere in the episode" is
+        # nearly certain by chance even for a fault the model cannot actually
+        # discriminate. Comparing this rate against the nominal false-flag rate
+        # is what shows whether there is real signal.
+        active = ep_df["fault_active"].values
+        if active.any():
+            ml_flagged_samples += int((preds[active] == -1).sum())
+            fault_active_samples += int(active.sum())
+
     n = len(episodes)
     return {
         "fault_type": fault_type,
@@ -109,6 +122,7 @@ def evaluate_fault_type(fault_type, episodes, model):
         "fdir_mean_latency_s": sum(fdir_latencies) / len(fdir_latencies) if fdir_latencies else None,
         "ml_recall": ml_detected / n if n else None,
         "ml_mean_latency_s": sum(ml_latencies) / len(ml_latencies) if ml_latencies else None,
+        "ml_per_sample_rate": ml_flagged_samples / fault_active_samples if fault_active_samples else None,
     }
 
 
@@ -204,12 +218,29 @@ def main():
     fig.tight_layout()
     fig.savefig(PLOT_PATH, dpi=120)
 
-    write_report(fault_results, fp, metadata)
+    split_stats = compute_split_stats(model, metadata["feature_columns"])
+    print(f"splits on imu_responded: {split_stats['splits_on_imu_responded']} of "
+          f"{split_stats['total_internal_nodes']} internal nodes")
+    write_report(fault_results, fp, metadata, split_stats)
     print(f"\nreport written to {REPORT_PATH}")
     print(f"plot written to {PLOT_PATH}")
 
 
-def write_report(fault_results, fp, metadata):
+def compute_split_stats(model, feature_names):
+    """How often does the model actually split on `imu_responded`? A feature
+    that's constant in nominal-only training data has zero variance and never
+    becomes a usable split point -- this quantifies that rather than asserting it."""
+    idx = feature_names.index("imu_responded")
+    used = sum(int((est.tree_.feature == idx).sum()) for est in model.estimators_)
+    total = sum(int((est.tree_.feature >= 0).sum()) for est in model.estimators_)
+    return {
+        "splits_on_imu_responded": used,
+        "total_internal_nodes": total,
+        "n_trees": len(model.estimators_),
+    }
+
+
+def write_report(fault_results, fp, metadata, split_stats):
     avg_nodes = metadata["avg_tree_node_count"]
     n_trees = metadata["n_estimators"]
     approx_bytes = n_trees * avg_nodes * 16  # ~16 bytes/node: feature idx + threshold + 2 child indices
@@ -237,35 +268,122 @@ def write_report(fault_results, fp, metadata):
                   "`IsolationForest.predict() == -1` (sklearn's own contamination-derived "
                   "threshold, not a hand-picked cutoff).")
     lines.append("")
-    lines.append("| Fault type | Episodes | FDIR recall | FDIR mean latency (s) | ML recall | ML mean latency (s) |")
-    lines.append("|---|---|---|---|---|---|")
+    nominal_rate = fp["ml_false_row_rate"]
+    lines.append("| Fault type | Episodes | FDIR recall | FDIR mean latency (s) | ML episode recall | ML mean latency (s) | ML per-sample flag rate | vs. nominal |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for r in fault_results:
         def fmt(x):
             return f"{x:.2f}" if isinstance(x, float) else "n/a"
+        psr = r.get("ml_per_sample_rate")
+        psr_s = f"{psr:.1%}" if psr is not None else "n/a"
+        ratio_s = f"{psr / nominal_rate:.1f}x" if (psr is not None and nominal_rate) else "n/a"
         lines.append(f"| {r['fault_type']} | {r['episodes']} | {fmt(r['fdir_recall'])} | "
-                      f"{fmt(r['fdir_mean_latency_s'])} | {fmt(r['ml_recall'])} | {fmt(r['ml_mean_latency_s'])} |")
+                      f"{fmt(r['fdir_mean_latency_s'])} | {fmt(r['ml_recall'])} | "
+                      f"{fmt(r['ml_mean_latency_s'])} | {psr_s} | {ratio_s} |")
+    lines.append("")
+    lines.append("### Read the last two columns, not the recall column")
+    lines.append("")
+    lines.append("**ML episode recall is the misleading number here, and it is reported only "
+                  "because it would be conspicuous to omit.** \"Episode recall\" asks *did at "
+                  "least one sample anywhere in this episode get flagged* -- and with ~250 "
+                  f"fault-active samples per episode against a threshold that flags {nominal_rate:.1%} "
+                  "of in-distribution samples by construction, that question answers itself "
+                  "affirmatively by chance alone, whether or not the model can actually "
+                  "discriminate the fault. This is the exact same episode-length artifact "
+                  "documented for false positives below; it inflates recall and false-alarm "
+                  "rate identically, and an earlier draft of this report applied that reasoning "
+                  "to only one of the two.")
+    lines.append("")
+    lines.append("The **per-sample flag rate against the nominal baseline** (last two columns) "
+                  "is the honest measure of discriminative power. On that measure:")
+    lines.append("")
+    for r in fault_results:
+        psr = r.get("ml_per_sample_rate")
+        if psr is None or not nominal_rate:
+            continue
+        ratio = psr / nominal_rate
+        if ratio >= 10:
+            verdict = "**strongly detected** -- unambiguous, orders of magnitude above baseline"
+        elif ratio >= 2:
+            verdict = ("weak but real signal -- elevated over baseline, though the score "
+                       "distributions overlap nominal substantially")
+        else:
+            verdict = ("**no discriminative power** -- flagged at or below the nominal false-alarm "
+                       "rate. Any episode-level \"recall\" for this fault is chance, not detection")
+        lines.append(f"- `{r['fault_type']}` ({ratio:.1f}x baseline): {verdict}.")
     lines.append("")
     drift_row = next((r for r in fault_results if r["fault_type"] == "gradual_drift"), None)
-    if drift_row and drift_row["fdir_recall"] is not None and drift_row["fdir_recall"] < 0.5 and drift_row["ml_recall"] and drift_row["ml_recall"] > 0.5:
-        lines.append("## Notable finding: gradual_drift")
+    lockup_row = next((r for r in fault_results if r["fault_type"] == "sensor_lockup"), None)
+    if drift_row and lockup_row:
+        drift_ratio = (drift_row["ml_per_sample_rate"] / nominal_rate) if nominal_rate else 0
+        lockup_ratio = (lockup_row["ml_per_sample_rate"] / nominal_rate) if nominal_rate else 0
+        lines.append("## What the ML layer actually adds")
         lines.append("")
-        lines.append(f"FDIR's adaptive baseline (`FDIR-006`, an EWMA over `bus_voltage_v`) recalled "
-                      f"**{drift_row['fdir_recall']:.0%}** of `gradual_drift` episodes; the trained "
-                      f"Isolation Forest recalled **{drift_row['ml_recall']:.0%}**. This is not a "
-                      "bug in the EWMA detector -- it is doing exactly what an online-adaptive "
-                      "statistic is supposed to do, continuously updating its notion of \"normal\" "
-                      "toward the current signal. That is precisely what makes it structurally "
-                      "unable to catch a *slow* drift: each sample-to-sample change is too small "
-                      "to ever exceed the deviation threshold, so the baseline just tracks the "
-                      "drift as the new normal instead of flagging it. The Isolation Forest, "
-                      "trained once on a fixed nominal reference and never updated afterward, has "
-                      "no such blind spot -- it still measures every new sample against the "
-                      "original training distribution. This is the concrete, measured version of "
-                      "the argument for adding a trained ML layer on top of adaptive statistics in "
-                      "the first place (see `docs/requirements/SRS.md`'s `FDIR-007` and "
-                      "`docs/architecture/phase0-1-engineering-decisions.md`, decision 4) -- not a "
-                      "hypothetical benefit, a specific failure mode this evaluation reproduced and "
-                      "measured.")
+        lines.append(f"**The one unambiguous win is `sensor_lockup`** ({lockup_ratio:.0f}x the "
+                      f"nominal flag rate, {lockup_row['ml_per_sample_rate']:.0%} of fault samples "
+                      "flagged). A frozen IMU drives every rolling-standard-deviation feature to "
+                      "exactly zero across six channels simultaneously -- a region of feature space "
+                      "with no nominal training data anywhere near it, which is precisely the "
+                      "situation an isolation-based method handles well. The score distribution "
+                      "for this fault is cleanly separated from nominal (see the plot below); it "
+                      "is the only fault type for which that is true.")
+        lines.append("")
+        lines.append(f"**`gradual_drift` is a weaker, more qualified result than an earlier draft "
+                      f"of this report claimed.** FDIR's adaptive baseline (`FDIR-006`, an EWMA "
+                      f"over `bus_voltage_v`) recalled **{drift_row['fdir_recall']:.0%}** of drift "
+                      "episodes -- a genuine, structural blind spot, and not a bug: an "
+                      "online-adaptive statistic continuously updates its notion of \"normal\" "
+                      "toward the current signal, so a drift slow enough that no single "
+                      "sample-to-sample step exceeds the deviation threshold simply gets absorbed "
+                      "as the new normal. A model trained once on a fixed reference and never "
+                      "updated does not have that blind spot, and the numbers do show the "
+                      f"Isolation Forest flagging drift samples at {drift_ratio:.1f}x the nominal "
+                      "rate -- real, consistent signal in the right direction.")
+        lines.append("")
+        timeout_row = next((r for r in fault_results if r["fault_type"] == "sensor_timeout"), None)
+        if timeout_row and nominal_rate and (timeout_row["ml_per_sample_rate"] / nominal_rate) < 2:
+            s = split_stats
+            lines.append("**And `sensor_timeout` is a structural blind spot for the model, for a "
+                          "reason worth understanding rather than patching over.** The only "
+                          "signature of this fault is the `imu_responded` flag going false; the "
+                          "environment still emits plausible-looking IMU values (that is what "
+                          "distinguishes a timeout from a lockup). But `imu_responded` is "
+                          "*constant at 1.0 throughout the nominal-only training set* -- zero "
+                          f"variance -- so no tree ever splits on it: a direct count over the "
+                          f"trained model finds **{s['splits_on_imu_responded']} splits on that "
+                          f"feature out of {s['total_internal_nodes']} internal nodes across all "
+                          f"{s['n_trees']} trees.** Flipping it to 0.0 at inference therefore "
+                          "changes no traversal path whatsoever, and the model is not merely bad "
+                          "at this fault but blind to it by construction.")
+            lines.append("")
+            lines.append("The general lesson, which applies well beyond this one fault: **any "
+                          "feature that is constant in nominal-only training data is invisible to "
+                          "an isolation-based detector, no matter how diagnostic it would be at "
+                          "inference time.** Training on normal data alone means the model can only "
+                          "learn to be surprised along axes that actually varied during training. "
+                          "This is not a tuning problem and more trees will not fix it.")
+            lines.append("")
+            lines.append("This is also a concrete argument *for* the hybrid architecture rather "
+                          "than against it. The deterministic layer catches `sensor_timeout` at "
+                          f"{timeout_row['fdir_recall']:.0%} recall in "
+                          f"{timeout_row['fdir_mean_latency_s']:.2f} s, because a response/no-response "
+                          "check needs no training distribution at all -- and the ML layer catches "
+                          "`sensor_lockup`, where a frozen-but-responding sensor produces perfectly "
+                          "in-range values that no fixed threshold would object to. The two layers "
+                          "have genuinely complementary blind spots, which is measured here, not "
+                          "assumed.")
+            lines.append("")
+        lines.append("But that is a **weak** separation, not a solved detection problem. At "
+                      f"{drift_row['ml_per_sample_rate']:.1%} of drift samples flagged, the score "
+                      "distributions overlap nominal heavily, and the 100% *episode* recall figure "
+                      "is largely the episode-length artifact described above rather than reliable "
+                      "per-sample detection. The correct reading is: **this measurement supports "
+                      "the direction of `FDIR-007`'s argument -- a trained model sees something the "
+                      "adaptive baseline structurally cannot -- without yet demonstrating a "
+                      "detector good enough to depend on for drift.** Whether that gap closes with "
+                      "better features (an explicit long-window trend feature would target drift "
+                      "directly), a different algorithm, or real rather than synthetic data is an "
+                      "open question, and deliberately not answered here.")
         lines.append("")
 
     lines.append("## False positive rate (nominal episodes only)")
