@@ -41,3 +41,6 @@ data/*.csv
 # simulator/dataset_gen.py's fixed seed -- keep the small manifest (it's the
 # audit trail), not the CSV itself.
 data/datasets/*.csv
+
+# Cached source PDFs for research analysis -- large and re-downloadable from NTRS
+research/analysis/_cache_*.pdf
