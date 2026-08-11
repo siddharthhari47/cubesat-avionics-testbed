@@ -246,3 +246,201 @@ def test_clear_all_stops_every_active_fault():
     assert truth.active_faults == []
     assert cfg.THERMAL_CRITICAL_LOW_C <= sample.temp_c <= cfg.THERMAL_CRITICAL_HIGH_C
     assert sample.bus_voltage_v > cfg.UNDERVOLTAGE_WARNING_V
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: physical state. Signals are DERIVED from rails/battery/thermal
+# rather than injected per-signal, and actuator commands are accepted.
+# ---------------------------------------------------------------------------
+
+from environment import (  # noqa: E402
+    LATCHUP_DRAW_MULTIPLIER,
+    LATCH_CLEAR_OFF_TIME_S,
+    RAIL_NOMINAL_DRAW_A,
+)
+from icd import Rail, ThermalNode  # noqa: E402
+
+
+def _settle(env, n=20, dt=0.1):
+    for _ in range(n):
+        sample, truth = env.step(dt)
+    return sample, truth
+
+
+def test_bus_current_is_the_sum_of_rail_draws_not_a_constant():
+    """
+    The Phase 2 premise. Before this, no injected fault perturbed
+    bus_current_a at all -- and overcurrent is the canonical latch-up
+    signature.
+    """
+    env = SpacecraftEnvironment(seed=1)
+    sample, _ = _settle(env)
+    assert sample.rail_current_a is not None
+    assert sum(sample.rail_current_a.values()) == pytest.approx(
+        sum(RAIL_NOMINAL_DRAW_A.values()), abs=1e-9
+    )
+    assert sample.bus_current_a == pytest.approx(sum(RAIL_NOMINAL_DRAW_A.values()), abs=0.1)
+
+
+def test_one_state_change_moves_current_voltage_and_temperature_together():
+    """
+    Coupling is the whole point: a latch-up is not five hand-written signal
+    overrides, it is one state change whose consequences follow.
+    """
+    env = SpacecraftEnvironment(seed=1)
+    before, _ = _settle(env)
+
+    env.inject("radio_latchup")
+    after, _ = _settle(env)
+
+    assert after.bus_current_a > before.bus_current_a, "current must rise"
+    assert after.bus_voltage_v < before.bus_voltage_v, "voltage must sag as a consequence"
+    assert after.rail_current_a[int(Rail.RADIO)] == pytest.approx(
+        RAIL_NOMINAL_DRAW_A[Rail.RADIO] * LATCHUP_DRAW_MULTIPLIER, abs=1e-9
+    )
+    assert after.radio_responded is False
+
+    hot, _ = _settle(env, n=900)
+    assert hot.node_temp_c[int(ThermalNode.RADIO)] > hot.node_temp_c[int(ThermalNode.OBC)] + 10, (
+        "the latched rail's own node must heat, not the whole spacecraft -- that "
+        "difference is what distinguishes a local fault from a thermal event"
+    )
+
+
+def test_latchup_bus_voltage_sag_stays_above_every_fixed_threshold():
+    """
+    Why per-rail current sensing is on the hardware shortlist: the aggregate
+    bus signature of a latch-up is a sag of tens of millivolts, comfortably
+    inside limits, while the per-rail current is unmistakable.
+    """
+    from fdir import config as cfg
+
+    env = SpacecraftEnvironment(seed=2)
+    _settle(env)
+    env.inject("radio_latchup")
+    sample, _ = _settle(env)
+
+    assert sample.bus_voltage_v > cfg.UNDERVOLTAGE_WARNING_V, (
+        "a latch-up must NOT be visible to the fixed voltage thresholds -- if it "
+        "were, per-rail sensing would not be needed"
+    )
+    assert sample.rail_current_a[int(Rail.RADIO)] > 4 * RAIL_NOMINAL_DRAW_A[Rail.RADIO]
+
+
+class TestLatchClearingRule:
+    """
+    The CSSWE / KySat-2 distinction, made executable:
+        power removed >= LATCH_CLEAR_OFF_TIME_S -> clears
+        too-brief a cycle                       -> does NOT clear
+        OBC reset                               -> does NOT clear
+    """
+
+    def _latched_env(self, seed):
+        env = SpacecraftEnvironment(seed=seed)
+        _settle(env)
+        env.inject("radio_latchup")
+        _settle(env, n=10)
+        return env
+
+    def test_power_removal_long_enough_clears_the_latch(self):
+        env = self._latched_env(3)
+        env.set_rail_power(Rail.RADIO, False)
+        _settle(env, n=3)               # 0.3 s, comfortably over the threshold
+        env.set_rail_power(Rail.RADIO, True)
+        sample, truth = _settle(env, n=10)
+
+        assert truth.rail_latched[int(Rail.RADIO)] is False
+        assert sample.radio_responded is True
+        assert sample.rail_current_a[int(Rail.RADIO)] == pytest.approx(
+            RAIL_NOMINAL_DRAW_A[Rail.RADIO], abs=1e-9
+        )
+
+    def test_too_brief_a_power_cycle_does_not_clear_the_latch(self):
+        env = self._latched_env(4)
+        env.set_rail_power(Rail.RADIO, False)
+        env.t += LATCH_CLEAR_OFF_TIME_S / 10.0    # far too short
+        env.set_rail_power(Rail.RADIO, True)
+        _sample, truth = _settle(env, n=5)
+
+        assert truth.rail_latched[int(Rail.RADIO)] is True, (
+            "off-time is load-bearing, not decorative"
+        )
+
+    def test_obc_reset_does_not_clear_the_latch(self):
+        """
+        KySat-2: it reset hourly, forever, and each reset re-entered the same
+        condition. The software forgets; the hardware does not.
+        """
+        env = self._latched_env(5)
+        before, _ = _settle(env, n=5)
+
+        env.obc_reset()
+        after, truth = _settle(env, n=10)
+
+        assert truth.rail_latched[int(Rail.RADIO)] is True
+        assert after.bus_current_a == pytest.approx(before.bus_current_a, abs=0.15)
+        assert env.obc_boot_count == 1
+
+    def test_recovery_failure_mode_executes_the_action_but_fault_persists(self):
+        """
+        latch_clears_on_power_cycle=False builds the KySat-2 case where the
+        recovery action runs correctly and achieves nothing -- physically a
+        latch upstream of the switch, or a failed switch.
+        """
+        env = SpacecraftEnvironment(seed=6, latch_clears_on_power_cycle=False)
+        _settle(env)
+        env.inject("radio_latchup")
+        _settle(env, n=10)
+
+        assert env.set_rail_power(Rail.RADIO, False) is True   # command accepted
+        _settle(env, n=5)
+        assert env.set_rail_power(Rail.RADIO, True) is True
+        sample, truth = _settle(env, n=10)
+
+        assert truth.rail_latched[int(Rail.RADIO)] is True
+        assert sample.radio_responded is False
+
+
+def test_overcurrent_drains_the_battery_while_voltage_stays_legal():
+    """
+    The KySat-2 mechanism. A rail eats the battery; every fixed voltage
+    threshold stays satisfied until, hours later, it doesn't.
+    """
+    from fdir import config as cfg
+
+    env = SpacecraftEnvironment(seed=7)
+    _settle(env)
+    soc_before = env.battery_soc
+    env.inject("rail_overcurrent")
+    sample, truth = _settle(env, n=600, dt=1.0)   # 10 simulated minutes
+
+    assert sample.bus_current_a > 1.0
+    assert sample.bus_voltage_v > cfg.UNDERVOLTAGE_WARNING_V, (
+        "the fault must be invisible to the fixed voltage thresholds -- that "
+        "delay is what killed KySat-2"
+    )
+    assert truth.battery_soc < soc_before - 0.05, "the battery must actually be draining"
+
+
+def test_determinism_survives_interleaved_actuator_commands():
+    """
+    Actuator commands must consume no RNG draws, or a replay with recovery
+    actions would diverge from one without them and determinism testing
+    would be meaningless.
+    """
+    def scripted(seed):
+        env = SpacecraftEnvironment(seed=seed)
+        out = []
+        for i in range(60):
+            if i == 20:
+                env.inject("radio_latchup")
+            if i == 35:
+                env.set_rail_power(Rail.RADIO, False)
+            if i == 38:
+                env.set_rail_power(Rail.RADIO, True)
+            sample, _ = env.step(0.1)
+            out.append((sample.bus_voltage_v, sample.bus_current_a, sample.temp_c))
+        return out
+
+    assert scripted(11) == scripted(11)
+    assert scripted(11) != scripted(12)

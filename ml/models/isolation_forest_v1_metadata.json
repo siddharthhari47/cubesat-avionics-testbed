@@ -47,7 +47,7 @@
   "seed": 0,
   "sklearn_version": "1.9.0",
   "python_version": "3.12.10",
-  "trained_at_unix_s": 1786304616.1936429,
-  "avg_tree_node_count": 124.56,
+  "trained_at_unix_s": 1786467781.6794374,
+  "avg_tree_node_count": 124.84,
   "status": "Trained -- evaluated on synthetic simulator data only, not hardware-tested"
 }

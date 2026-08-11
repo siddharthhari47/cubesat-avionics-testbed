@@ -11,9 +11,12 @@
     "sensor_lockup",
     "undervoltage",
     "gradual_drift",
-    "thermal"
+    "thermal",
+    "radio_latchup",
+    "rail_overcurrent",
+    "communication_loss"
   ],
-  "total_episodes": 115,
-  "total_samples": 69000,
-  "generated_at_unix_s_placeholder": 1786304613.5075164
+  "total_episodes": 160,
+  "total_samples": 96000,
+  "generated_at_unix_s_placeholder": 1786467773.4013436
 }

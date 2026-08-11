@@ -29,10 +29,40 @@ Wire encoding (struct formats, packing, CRC) deliberately stays in
 simulator/protocol.py — that is transport, not vocabulary.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
+from typing import Dict, Optional
 
-__all__ = ["Mode", "FaultFlag", "HealthFlag", "RawSample"]
+__all__ = ["Mode", "FaultFlag", "HealthFlag", "RawSample", "Rail", "ThermalNode"]
+
+
+class Rail(IntEnum):
+    """
+    Switchable power rails. IntEnum so it maps to a uint8 device id in C.
+
+    Per-rail current sensing and independently switchable loads is the one
+    hardware capability the failure research put a purchase deadline on: the
+    case study attributes KySat-2's loss to its absence, and the
+    radio_latchup / radio_unresponsive discrimination pair exists specifically
+    to measure what it buys before the board is bought.
+    """
+
+    OBC = 0
+    RADIO = 1
+    SENSORS = 2
+    ADCS = 3
+    PAYLOAD = 4
+
+
+class ThermalNode(IntEnum):
+    """Lumped thermal masses. Separate nodes are what let a local heat source
+    (a latched-up radio) be distinguished from a genuine spacecraft-wide
+    thermal event, and from a drifting temperature sensor."""
+
+    BATTERY = 0
+    RADIO = 1
+    OBC = 2
+    STRUCTURE = 3
 
 
 class Mode(IntEnum):
@@ -109,3 +139,18 @@ class RawSample:
     bus_current_a: float
     imu_responded: bool = True
     temp_responded: bool = True
+
+    # --- extended observables (Phase 2) --------------------------------------
+    # Defaulted so every existing construction site keeps working unchanged.
+    #
+    # These are deliberately NOT on the wire yet. Adding per-rail current to
+    # the telemetry packet is an ICD revision with a firmware and ground-station
+    # cost, and the decision of whether it earns its bytes should be made from
+    # the measurement the discrimination-pair scenarios produce, not before it.
+    # Until then they are available to detectors running onboard, which is
+    # exactly where a latch-up detector would live anyway.
+    rail_current_a: Optional[Dict[int, float]] = None
+    node_temp_c: Optional[Dict[int, float]] = None
+    radio_responded: bool = True
+    mag_responded: bool = True
+    seconds_since_ground_contact: Optional[float] = None

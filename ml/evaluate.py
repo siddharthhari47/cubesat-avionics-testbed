@@ -258,6 +258,27 @@ def write_report(fault_results, fp, metadata, split_stats):
                   f"(seed {metadata['seed']}). Evaluated on a held-out dataset generated with "
                   f"seed {HELD_OUT_SEED} -- disjoint episodes, never seen during training.")
     lines.append("")
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "simulator"))
+        from environment import FAULT_TYPES as _ALL_FAULTS
+        unscored = sorted(set(_ALL_FAULTS) - set(FAULT_TO_EXPECTED_FLAG))
+    except Exception:
+        unscored = []
+    if unscored:
+        lines.append("## Coverage gap (read before the table)")
+        lines.append("")
+        lines.append("The simulator can now inject **" + str(len(_ALL_FAULTS)) + "** fault types, but this "
+                      "report scores only **" + str(len(FAULT_TO_EXPECTED_FLAG)) + "**. Unscored: "
+                      + ", ".join(f"`{f}`" for f in unscored) + ".")
+        lines.append("")
+        lines.append("These are unscored because **no detector exists for them yet** -- there is no "
+                      "`FaultFlag` they map to, so there is nothing to measure a deterministic recall "
+                      "against and no honest baseline to compare the model with. They were added to the "
+                      "environment in Phase 2 (physical state) ahead of the detectors that will consume "
+                      "them in later phases. Their episodes are present in the generated dataset and do "
+                      "influence the nominal/anomalous score distributions, but no claim is made about "
+                      "detecting them. Do not read the table below as covering the full fault set.")
+        lines.append("")
     lines.append("## Per-fault-type detection: FDIR (deterministic) vs. ML (Isolation Forest)")
     lines.append("")
     lines.append("No single blended \"accuracy\" number is reported here on purpose -- it would "
