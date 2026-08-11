@@ -57,6 +57,7 @@ Every command gets exactly one of these back, per `COM-002` (within 1 s).
 | 0x04 | REJECTED_SAFE_MODE_FAULT_ACTIVE |
 | 0x05 | REJECTED_NOT_ALLOWED_IN_MODE |
 | 0x06 | REJECTED_NOT_IMPLEMENTED |
+| 0x07 | REJECTED_CONDITION_STILL_ACTIVE |
 
 ## Notes
 
@@ -64,6 +65,18 @@ Every command gets exactly one of these back, per `COM-002` (within 1 s).
   command still gets an ack — `REJECTED_BAD_CHECKSUM` — using the sentinel
   `seq_num`/`cmd_id` values above, since the real values in a corrupted packet
   can't be trusted.
+- **A command that achieves nothing must not report `ACCEPTED`.**
+  `RESET_FAULTS` returns `REJECTED_CONDITION_STILL_ACTIVE` (0x07) when every
+  latched flag it was asked to clear is still backed by an active condition.
+  It previously always returned `ACCEPTED`, which made a refused reset
+  indistinguishable from a successful one — unacceptable in a system whose
+  whole premise is verifying what an action actually did. `ACCEPTED` means
+  either "something was cleared" or "there was nothing to clear".
+- **`RESET_FAULTS` requires positive evidence.** A condition-backed flag clears
+  only after the engine has *observed* the condition non-breaching for
+  `RESET_EVIDENCE_SAMPLES` consecutive samples. Event flags
+  (`WATCHDOG_RESET`, `CORRUPTED_PACKET`) record something that already happened
+  rather than an ongoing condition, so acknowledging them always clears them.
 - **`ENTER_SAFE_MODE` is intentionally unrestricted** — an operator should always be
   able to force SAFE mode as a manual safety action, regardless of current state.
   `EXIT_SAFE_MODE` is the direction that's restricted, matching `FDIR-005`.

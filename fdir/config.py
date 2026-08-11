@@ -60,3 +60,15 @@ LOCKUP_WINDOW_SAMPLES = 5
 # --- SAFE-mode false-positive budget (FDIR-008) -------------------------------
 
 MAX_FALSE_SAFE_ENTRIES_PER_6H = 1
+
+# --- reset evidence (D2) -------------------------------------------------------
+# RESET_FAULTS may only clear a latched flag on POSITIVE evidence that the
+# condition has gone away -- this many consecutive non-breaching observations --
+# never on mere absence of evidence.
+#
+# Why this exists: reset_faults() used to infer "cleared" from a debounce timer
+# being None. start_boot() sets those timers to None, so reboot -> RESET_FAULTS
+# -> EXIT_SAFE_MODE returned a still-faulted vehicle to service, defeating the
+# very requirement (FDIR-005) the guards were written to enforce. Counting
+# clean observations cannot be satisfied by erasing state.
+RESET_EVIDENCE_SAMPLES = 3

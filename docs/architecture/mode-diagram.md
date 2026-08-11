@@ -41,7 +41,8 @@ stateDiagram-v2
 |---|---|---|
 | BOOT -> NOMINAL | Peripheral init and self-check complete, no critical fault | SYS-003 |
 | BOOT -> SAFE | Critical fault detected during init (e.g. essential sensor fails self-check) | FDIR-001 |
-| NOMINAL/TEST -> SAFE | Any fault meets SAFE-mode criteria (undervoltage-critical, comms loss, etc.), confirmed via that fault's persistence/debounce rule — see below | FSW-004, FDIR-002, FDIR-003, FDIR-006, COM-003 |
+| NOMINAL/TEST -> SAFE | A fault in `SAFE_MODE_TRIGGER_FLAGS` latches: **UNDERVOLTAGE_CRITICAL, THERMAL_ANOMALY, or SENSOR_LOCKUP only**, each confirmed via its persistence/debounce rule — see below | FSW-004, FDIR-003, FDIR-009, FDIR-010 |
+| BOOT -> SAFE | Same gate, evaluated at end of boot self-check. Gated on `SAFE_MODE_TRIGGER_FLAGS`, **not** on any latched bit — an informational flag such as `WATCHDOG_RESET` must not strand a healthy vehicle in a state only the ground can exit | FSW-004 |
 | NOMINAL -> TEST | Operator sends `ENABLE` for a test function | COM-002 |
 | TEST -> NOMINAL | Operator sends `DISABLE` for the active test function | COM-002 |
 | SAFE -> NOMINAL | Operator sends `EXIT_SAFE_MODE`, accepted only if the fault(s) that triggered SAFE have been cleared (typically via `RESET_FAULTS` first) | FDIR-005 |

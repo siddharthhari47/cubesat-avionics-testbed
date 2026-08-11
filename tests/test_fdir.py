@@ -317,16 +317,27 @@ def test_exit_safe_mode_requires_condition_clear_and_reset_faults():
 
     # Condition clears (nominal voltage again), but the latched flag does not
     # auto-clear -- EXIT_SAFE_MODE must still be rejected.
-    now += dt
-    variant += 1
-    engine.tick(make_sample(bus_voltage_v=5.0, variant=variant), now)
-    assert engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL, "flag must not self-clear"
-    assert engine.exit_safe_mode(now) is False
-    assert engine.mode == Mode.SAFE
+    #
+    # Phase 0 note (D2): this loop used to be a single tick. reset_faults() now
+    # requires RESET_EVIDENCE_SAMPLES consecutive non-breaching observations as
+    # POSITIVE evidence that the condition has gone, rather than inferring it
+    # from a debounce timer being None -- because start_boot() nulls those same
+    # timers, which let a reboot manufacture the evidence and return a
+    # still-faulted vehicle to service. One clean sample is no longer enough,
+    # deliberately, and that is a strictly safer contract.
+    for _ in range(cfg.RESET_EVIDENCE_SAMPLES):
+        now += dt
+        variant += 1
+        engine.tick(make_sample(bus_voltage_v=5.0, variant=variant), now)
+        assert engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL, "flag must not self-clear"
+        assert engine.exit_safe_mode(now) is False
+        assert engine.mode == Mode.SAFE
 
     # Operator explicitly acknowledges via RESET_FAULTS -- only now, because
-    # the condition is genuinely no longer breaching, does the flag clear.
-    engine.reset_faults(now)
+    # the condition has been *observed* non-breaching for long enough, does it clear.
+    cleared, still_latched = engine.reset_faults(now)
+    assert cleared & FaultFlag.UNDERVOLTAGE_CRITICAL
+    assert not (still_latched & FaultFlag.UNDERVOLTAGE_CRITICAL)
     assert not (engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL)
 
     # Now, and only now, EXIT_SAFE_MODE is accepted.
@@ -443,3 +454,195 @@ def test_comms_loss_boot_guard_regression():
     # Once out of BOOT, the guard must NOT still be suppressing the flag --
     # still no client connected, so COMMS_LOSS should now be flagged for real.
     assert sim.engine.fault_flags & FaultFlag.COMMS_LOSS
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 regressions: defects found by the V0 architecture audit.
+# See docs/architecture/v0-gap-analysis-and-plan.md sections D1-D4.
+# ---------------------------------------------------------------------------
+
+def test_watchdog_reset_on_healthy_vehicle_does_not_strand_in_safe():
+    """
+    D1. WATCHDOG_RESET is informational -- it records why we booted, not that
+    anything is wrong. Gating the end-of-boot decision on bare truthiness of
+    fault_flags meant a perfectly healthy vehicle that experienced a watchdog
+    reset landed in SAFE with no autonomous way out.
+
+    That is the CSSWE failure mode in our own code: if the reason for the reset
+    was a comms problem, the operator command that could free the vehicle
+    cannot arrive. The gate must be SAFE_MODE_TRIGGER_FLAGS.
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    engine.watchdog_reset(now)
+    now += 0.05
+    assert engine.mode == Mode.BOOT
+    assert engine.fault_flags & FaultFlag.WATCHDOG_RESET
+
+    for i in range(_SEARCH_BOUND):
+        engine.tick(make_sample(variant=i), now)
+        now += 0.05
+        if engine.mode != Mode.BOOT:
+            break
+    else:
+        pytest.fail("engine never left BOOT after a watchdog reset")
+
+    assert engine.mode == Mode.NOMINAL, (
+        f"a healthy vehicle must return to NOMINAL after a watchdog reset, got {engine.mode!r} "
+        "-- an informational flag must not command SAFE"
+    )
+    assert engine.fault_flags & FaultFlag.WATCHDOG_RESET, (
+        "the reset should still be recorded, just not treated as a fault condition"
+    )
+
+
+def test_advisory_only_flag_cannot_command_safe_at_end_of_boot():
+    """
+    D1, the architectural half. ADAPTIVE_ANOMALY and ML_ANOMALY are excluded
+    from SAFE_MODE_TRIGGER_FLAGS, so they must not be able to command SAFE at
+    the end of boot either -- otherwise the boundary has a hole in exactly the
+    place a cold-start false positive is most likely.
+    """
+    engine = FDIREngine()
+    engine.fault_flags |= FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
+
+    now = 0.0
+    for i in range(_SEARCH_BOUND):
+        engine.tick(make_sample(variant=i), now)
+        now += 0.05
+        if engine.mode != Mode.BOOT:
+            break
+
+    assert engine.mode == Mode.NOMINAL, (
+        f"advisory-only flags must not force SAFE at end of boot, got {engine.mode!r}"
+    )
+
+
+def test_reset_faults_requires_positive_evidence_not_absence_of_evidence():
+    """
+    D2, the highest-severity defect found. reset_faults() used to infer
+    "condition cleared" from a debounce timer being None -- but start_boot()
+    also sets those timers to None. So:
+
+        reboot -> RESET_FAULTS -> EXIT_SAFE_MODE
+
+    returned a still-faulted vehicle to service, defeating FDIR-005, the exact
+    requirement those guards were written to enforce.
+
+    The fix counts consecutive non-breaching observations. A reboot cannot
+    manufacture that evidence by erasing state.
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    # Undervoltage, and it stays physically present for the whole test.
+    for i in range(_SEARCH_BOUND):
+        engine.tick(make_sample(bus_voltage_v=3.8, variant=i), now)
+        now += 0.05
+        if engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
+            break
+    assert engine.mode == Mode.SAFE
+
+    # Reboot while the fault is still physically present.
+    engine.watchdog_reset(now)
+    now += 0.05
+
+    cleared, still_latched = engine.reset_faults(now)
+    assert not (cleared & FaultFlag.UNDERVOLTAGE_CRITICAL), (
+        "a reboot must not manufacture evidence that a still-present fault has cleared"
+    )
+    assert still_latched & FaultFlag.UNDERVOLTAGE_CRITICAL
+    assert engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL
+
+
+def test_reset_faults_clears_once_condition_genuinely_observed_clear():
+    """The other direction of D2 -- evidence really does clear the flag."""
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    for i in range(_SEARCH_BOUND):
+        engine.tick(make_sample(bus_voltage_v=3.8, variant=i), now)
+        now += 0.05
+        if engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
+            break
+
+    # Voltage genuinely recovers, and we observe it for longer than the
+    # evidence window.
+    for i in range(cfg.RESET_EVIDENCE_SAMPLES + 3):
+        engine.tick(make_sample(variant=100 + i), now)
+        now += 0.05
+
+    cleared, still_latched = engine.reset_faults(now)
+    assert cleared & FaultFlag.UNDERVOLTAGE_CRITICAL
+    assert not (still_latched & FaultFlag.UNDERVOLTAGE_CRITICAL)
+    assert engine.exit_safe_mode(now) is True
+    assert engine.mode == Mode.NOMINAL
+
+
+def test_reset_faults_reports_refusal_rather_than_claiming_success():
+    """
+    D4. RESET_FAULTS used to ACK ACCEPTED even when it cleared nothing, so an
+    operator could not distinguish a refused reset from a successful one. For a
+    project whose thesis is "verify what your actions actually did", the command
+    interface must not lie about outcomes.
+    """
+    import time
+    from protocol import AckStatus, CommandId, CommandPacket
+
+    rate = 20.0
+    sim = Simulator(telemetry_rate_hz=rate, seed=4)
+    for _ in range(50):
+        sim.tick()
+        time.sleep(1.0 / rate)
+
+    sim.inject("undervoltage")
+    for _ in range(20):
+        sim.tick()
+        time.sleep(1.0 / rate)
+    assert sim.engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL
+
+    ack = sim.handle_command(CommandPacket(seq_num=1, cmd_id=CommandId.RESET_FAULTS))
+    assert ack.status == AckStatus.REJECTED_CONDITION_STILL_ACTIVE, (
+        "a reset that cleared nothing must not report ACCEPTED"
+    )
+    assert sim.engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "D3, KNOWN DEFECT, scheduled for Phase 4. A data-path fault that zeros the "
+        "bus produces a repeating IMU fingerprint, so SENSOR_LOCKUP latches and -- "
+        "because SENSOR_LOCKUP holds autonomous SAFE authority -- safes the vehicle "
+        "for a fault that is not in the IMU. This is the Delfi-C3 misdiagnosis "
+        "reproduced in our own code (case study section 5.2). The fix is R6: every "
+        "per-channel detector must pass a data-path-health discriminator before it "
+        "gets autonomous authority. When Phase 4 lands, this test starts passing and "
+        "strict=True will fail the suite until this marker is removed."
+    ),
+)
+def test_zeroed_data_bus_is_not_misdiagnosed_as_a_frozen_imu():
+    """
+    The Delfi-C3 reproduction. TU Delft documented a CDHS flaw causing
+    "insertion of zero's in the telemetry data"; the spacecraft's protective
+    responses then fired against subsystems that were themselves fine.
+
+    Here every IMU channel reads exactly 0.0 while the device still ACKs --
+    the signature of a dead bus, not a dead sensor. The desired behaviour is
+    that this does NOT latch SENSOR_LOCKUP and does NOT command SAFE.
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    zeroed = dict(accel=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0), imu_responded=True)
+    for _ in range(cfg.LOCKUP_WINDOW_SAMPLES + 3):
+        engine.tick(make_sample(**zeroed), now)
+        now += 0.05
+
+    assert not (engine.fault_flags & FaultFlag.SENSOR_LOCKUP), (
+        "a zeroed data path must not be diagnosed as a frozen IMU"
+    )
+    assert engine.mode != Mode.SAFE, (
+        "a data-path fault must not command SAFE via a per-channel detector"
+    )

@@ -137,6 +137,10 @@ typedef enum {
 #define ACK_REJECTED_SAFE_MODE_FAULT_ACTIVE     0x04u
 #define ACK_REJECTED_NOT_ALLOWED_IN_MODE        0x05u
 #define ACK_REJECTED_NOT_IMPLEMENTED            0x06u
+/* Command understood and attempted, but achieved nothing because the underlying
+ * condition is still present. Keeps a refused RESET_FAULTS distinguishable from
+ * a successful one. Additive to a uint8 field -- no packet layout change. */
+#define ACK_REJECTED_CONDITION_STILL_ACTIVE     0x07u
 
 /* Sentinel values for a corrupted CommandPacket's ack (command-dictionary.md
  * "Checksum failures never get silently dropped"): the real seq_num/cmd_id

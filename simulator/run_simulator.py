@@ -132,7 +132,12 @@ class Simulator:
             return AckStatus.ACCEPTED if accepted else AckStatus.REJECTED_SAFE_MODE_FAULT_ACTIVE
 
         if cmd.cmd_id == CommandId.RESET_FAULTS:
-            self.engine.reset_faults(now)
+            cleared, still_latched = self.engine.reset_faults(now)
+            # Report what actually happened. Previously this always ACKed
+            # ACCEPTED even when it cleared nothing, so a refused reset was
+            # indistinguishable from a successful one (D4).
+            if still_latched and not cleared:
+                return AckStatus.REJECTED_CONDITION_STILL_ACTIVE
             return AckStatus.ACCEPTED
 
         if cmd.cmd_id == CommandId.REQUEST_LOG:

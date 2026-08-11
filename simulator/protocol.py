@@ -67,6 +67,11 @@ class AckStatus(IntEnum):
     REJECTED_SAFE_MODE_FAULT_ACTIVE = 0x04
     REJECTED_NOT_ALLOWED_IN_MODE = 0x05
     REJECTED_NOT_IMPLEMENTED = 0x06
+    # The command was understood and attempted, but achieved nothing because the
+    # underlying condition is still present. Distinct from ACCEPTED so an operator
+    # can tell a refused RESET_FAULTS from a successful one (D4). Additive to a
+    # uint8 field -- no packet layout change.
+    REJECTED_CONDITION_STILL_ACTIVE = 0x07
 
 
 # --- Telemetry packet ---------------------------------------------------

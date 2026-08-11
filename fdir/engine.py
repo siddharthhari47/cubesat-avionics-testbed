@@ -32,7 +32,7 @@ import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "simulator"))
 from protocol import FaultFlag, HealthFlag, Mode  # noqa: E402
@@ -47,6 +47,19 @@ from . import config as cfg
 SAFE_MODE_TRIGGER_FLAGS = (
     FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY | FaultFlag.SENSOR_LOCKUP
 )
+
+# Flags backed by an ongoing physical condition. RESET_FAULTS may clear these
+# only on positive evidence that the condition has gone away (see reset_faults).
+CONDITION_BACKED_FLAGS = (
+    FaultFlag.SENSOR_TIMEOUT | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
+    | FaultFlag.SENSOR_LOCKUP | FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
+)
+
+# Flags recording that something happened, not that something is wrong.
+# Acknowledging them always clears them.
+EVENT_FLAGS = FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET
+
+RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
 
 
 @dataclass
@@ -130,6 +143,12 @@ class FDIREngine:
         self._imu_history: deque = deque(maxlen=cfg.LOCKUP_WINDOW_SAMPLES)
         self._ml_breach_count = 0
 
+        # Consecutive non-breaching observations per fault flag. This is the
+        # POSITIVE evidence reset_faults() requires (D2). Deliberately not
+        # derived from the debounce timers, because start_boot() clears those --
+        # a reset must not be able to manufacture evidence by erasing state.
+        self._clean_ticks: Dict[int, int] = {}
+
     # ---- lifecycle -------------------------------------------------
 
     def start_boot(self, now: float) -> None:
@@ -140,6 +159,19 @@ class FDIREngine:
         self._thermal_since = None
         self._ml_breach_count = 0
         self._imu_history.clear()
+        # A reboot destroys what we knew about every condition. Evidence of
+        # clearance must be re-earned by observation, not inherited.
+        self._clean_ticks.clear()
+
+    def _observe(self, flag: FaultFlag, breaching: bool) -> None:
+        """Record whether a condition is currently breaching, for reset evidence."""
+        if breaching:
+            self._clean_ticks[int(flag)] = 0
+        else:
+            self._clean_ticks[int(flag)] = self._clean_ticks.get(int(flag), 0) + 1
+
+    def _has_cleared(self, flag: FaultFlag) -> bool:
+        return self._clean_ticks.get(int(flag), 0) >= cfg.RESET_EVIDENCE_SAMPLES
 
     def _emit(self, now: float, message: str) -> None:
         self.log.append((now, message))
@@ -151,9 +183,19 @@ class FDIREngine:
             self.start_boot(now)
 
         if self.mode == Mode.BOOT and now - self._boot_started_at >= cfg.BOOT_DURATION_S:
-            if self.fault_flags:
+            # Gate on SAFE_MODE_TRIGGER_FLAGS, NOT on bare truthiness (D1).
+            # Bare truthiness meant any latched bit safed the vehicle at end of
+            # boot -- including WATCHDOG_RESET, which is informational (it records
+            # why you booted, not that anything is wrong). A healthy spacecraft
+            # that experienced a watchdog reset therefore landed in SAFE with no
+            # autonomous way out, which is the CSSWE failure mode: if the reason
+            # you reset was a comms problem, the operator command that could free
+            # you cannot arrive. It also let advisory-only flags (ADAPTIVE_ANOMALY,
+            # ML_ANOMALY) claim SAFE authority here that they are explicitly denied
+            # in NOMINAL -- a hole in the architecture's central boundary.
+            if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS:
                 self.mode = Mode.SAFE
-                self._emit(now, "BOOT -> SAFE: fault present at end of boot self-check")
+                self._emit(now, f"BOOT -> SAFE: {FaultFlag(self.fault_flags & SAFE_MODE_TRIGGER_FLAGS)!r} at end of boot self-check")
             else:
                 self.mode = Mode.NOMINAL
                 self._emit(now, "BOOT -> NOMINAL: self-check clean")
@@ -177,6 +219,7 @@ class FDIREngine:
     # (debounce), not by being quick to forgive after the fact.
 
     def _update_sensor_timeout(self, sample: RawSample, now: float) -> None:
+        self._observe(FaultFlag.SENSOR_TIMEOUT, not sample.imu_responded)
         if not sample.imu_responded:
             self.health_flags &= ~HealthFlag.IMU_OK
             if self._sensor_timeout_since is None:
@@ -190,6 +233,8 @@ class FDIREngine:
             self._sensor_timeout_since = None
 
     def _update_undervoltage(self, sample: RawSample, now: float) -> None:
+        self._observe(FaultFlag.UNDERVOLTAGE_CRITICAL,
+                      sample.bus_voltage_v < cfg.UNDERVOLTAGE_CRITICAL_V)
         if sample.bus_voltage_v < cfg.UNDERVOLTAGE_CRITICAL_V:
             if self._undervoltage_since is None:
                 self._undervoltage_since = now
@@ -206,6 +251,7 @@ class FDIREngine:
 
     def _update_thermal(self, sample: RawSample, now: float) -> None:
         out_of_band = not (cfg.THERMAL_CRITICAL_LOW_C <= sample.temp_c <= cfg.THERMAL_CRITICAL_HIGH_C)
+        self._observe(FaultFlag.THERMAL_ANOMALY, out_of_band)
         if out_of_band:
             if self._thermal_since is None:
                 self._thermal_since = now
@@ -231,12 +277,16 @@ class FDIREngine:
             fingerprint = (sample.accel_x, sample.accel_y, sample.accel_z,
                            sample.gyro_x, sample.gyro_y, sample.gyro_z)
             self._imu_history.append(fingerprint)
-            if (len(self._imu_history) == cfg.LOCKUP_WINDOW_SAMPLES
-                    and len(set(self._imu_history)) == 1):
+            frozen = (len(self._imu_history) == cfg.LOCKUP_WINDOW_SAMPLES
+                      and len(set(self._imu_history)) == 1)
+            self._observe(FaultFlag.SENSOR_LOCKUP, frozen)
+            if frozen:
                 if not self.fault_flags & FaultFlag.SENSOR_LOCKUP:
                     self._emit(now, "SENSOR_LOCKUP latched (IMU reading frozen)")
                 self.fault_flags |= FaultFlag.SENSOR_LOCKUP
         else:
+            # Not responding is a different fault (SENSOR_TIMEOUT). We have no
+            # evidence either way about freezing, so record none.
             self._imu_history.clear()
 
     def _update_adaptive_baseline(self, sample: RawSample, now: float) -> None:
@@ -253,7 +303,9 @@ class FDIREngine:
 
         voltage = sample.bus_voltage_v
         warmed_up = self._adaptive_sample_count >= cfg.MIN_ADAPTIVE_SAMPLES
-        if warmed_up and self.voltage_baseline.deviation_sigma(voltage) > cfg.ADAPTIVE_K:
+        breaching = warmed_up and self.voltage_baseline.deviation_sigma(voltage) > cfg.ADAPTIVE_K
+        self._observe(FaultFlag.ADAPTIVE_ANOMALY, breaching)
+        if breaching:
             self._adaptive_breach_count += 1
             if self._adaptive_breach_count >= cfg.ADAPTIVE_DEBOUNCE_SAMPLES:
                 if not self.fault_flags & FaultFlag.ADAPTIVE_ANOMALY:
@@ -272,7 +324,13 @@ class FDIREngine:
         # set FaultFlag.ML_ANOMALY; it cannot reach `self.mode`.
         if ml_advisory is None or self.mode == Mode.BOOT or not ml_advisory.is_anomalous:
             self._ml_breach_count = 0
+            # No advisory, or an advisory saying "normal", both count as evidence
+            # of non-breach -- otherwise a latched ML_ANOMALY could never be
+            # cleared once the model stopped reporting.
+            if self.mode != Mode.BOOT:
+                self._observe(FaultFlag.ML_ANOMALY, False)
             return
+        self._observe(FaultFlag.ML_ANOMALY, True)
         self._ml_breach_count += 1
         if self._ml_breach_count >= cfg.ML_ANOMALY_DEBOUNCE_SAMPLES:
             if not self.fault_flags & FaultFlag.ML_ANOMALY:
@@ -299,28 +357,38 @@ class FDIREngine:
         self._emit(now, "SAFE -> NOMINAL by operator command (triggering fault cleared)")
         return True
 
-    def reset_faults(self, now: float) -> None:
+    def reset_faults(self, now: float) -> Tuple[FaultFlag, FaultFlag]:
         """
-        Clears each latched flag IF its own debounce/window state shows the
-        condition isn't currently breaching -- derived entirely from this
-        engine's own tracked state, not from simulation ground truth. This is
-        deliberately the same information real firmware would have: whether
-        the last several samples have been back inside tolerance.
+        Clears each latched condition-backed flag only on POSITIVE evidence that
+        the condition has gone away: RESET_EVIDENCE_SAMPLES consecutive
+        non-breaching observations, counted by _observe().
+
+        Returns (cleared, still_latched) so the caller can report the real
+        outcome instead of assuming success (D4). Event flags
+        (WATCHDOG_RESET, CORRUPTED_PACKET) record something that already
+        happened rather than an ongoing condition, so acknowledging them always
+        clears them.
+
+        This deliberately requires evidence rather than absence of evidence.
+        The previous implementation inferred "cleared" from a debounce timer
+        being None, which start_boot() also does -- so a reboot manufactured
+        the evidence and a still-faulted vehicle could be returned to service.
         """
-        if self._sensor_timeout_since is None:
-            self.fault_flags &= ~FaultFlag.SENSOR_TIMEOUT
-        if self._undervoltage_since is None:
-            self.fault_flags &= ~FaultFlag.UNDERVOLTAGE_CRITICAL
-        if self._thermal_since is None:
-            self.fault_flags &= ~FaultFlag.THERMAL_ANOMALY
-        if not (len(self._imu_history) == cfg.LOCKUP_WINDOW_SAMPLES and len(set(self._imu_history)) == 1):
-            self.fault_flags &= ~FaultFlag.SENSOR_LOCKUP
-        if self._adaptive_breach_count == 0:
-            self.fault_flags &= ~FaultFlag.ADAPTIVE_ANOMALY
-        if self._ml_breach_count == 0:
-            self.fault_flags &= ~FaultFlag.ML_ANOMALY
-        self.fault_flags &= ~(FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET)
-        self._emit(now, "RESET_FAULTS applied")
+        before = self.fault_flags
+        for flag in CONDITION_BACKED_FLAGS:
+            if self.fault_flags & flag and self._has_cleared(flag):
+                self.fault_flags &= ~flag
+        self.fault_flags &= ~EVENT_FLAGS
+
+        cleared = FaultFlag(before & ~self.fault_flags)
+        still_latched = FaultFlag(self.fault_flags & RESETTABLE_FLAGS)
+        if cleared:
+            self._emit(now, f"RESET_FAULTS cleared {cleared!r}")
+        if still_latched:
+            self._emit(now, f"RESET_FAULTS refused {still_latched!r}: condition not confirmed clear")
+        if not cleared and not still_latched:
+            self._emit(now, "RESET_FAULTS applied (nothing latched)")
+        return cleared, still_latched
 
     def enter_test_mode(self) -> bool:
         if self.mode not in (Mode.NOMINAL, Mode.TEST):
