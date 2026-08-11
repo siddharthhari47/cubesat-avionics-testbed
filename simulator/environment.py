@@ -29,7 +29,10 @@ from typing import Dict, List, Optional
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from fdir.engine import RawSample  # noqa: E402
+# RawSample comes from icd/, not fdir/ -- a sensor source must be able to build
+# one without importing the decision engine. This import used to point at
+# fdir.engine and formed half of an import cycle. See icd/__init__.py.
+from icd import RawSample  # noqa: E402
 
 NOMINAL_VOLTAGE_V = 5.0
 NOMINAL_CURRENT_A = 0.4

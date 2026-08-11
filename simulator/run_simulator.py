@@ -68,21 +68,15 @@ class Simulator:
             return self._build_packet(sample)
 
     def _update_comms_loss(self, now):
-        # Link-level, not a fault about the spacecraft's own state -- stays
-        # here rather than in fdir/engine.py, which has no concept of sockets.
-        # BOOT guard matters: "no client connected yet" is normal during boot,
-        # not a fault -- the same class of cold-start false positive as the
-        # adaptive-baseline and lockup detectors, dropped once already during
-        # this refactor and now put back deliberately.
-        if self.engine.mode == Mode.BOOT:
-            return
+        # The transport OBSERVES the link and reports it; the engine DECIDES
+        # what that means, applies the BOOT guard, and owns the timeout from
+        # fdir/config.py. This used to write engine.fault_flags directly with a
+        # hardcoded 5.0 while config's COMMS_LOSS_TIMEOUT_S went unused (D6).
         with self.conn_lock:
             connected = self.conn is not None
             last_seen = self.last_client_seen
-        if connected:
-            self.engine.fault_flags &= ~FaultFlag.COMMS_LOSS
-        elif last_seen is None or now - last_seen >= 5.0:
-            self.engine.fault_flags |= FaultFlag.COMMS_LOSS
+        seconds_since_contact = None if last_seen is None else now - last_seen
+        self.engine.note_link_state(now, connected, seconds_since_contact)
 
     def _build_packet(self, sample) -> TelemetryPacket:
         self.seq_num = (self.seq_num + 1) % 65536
@@ -205,7 +199,7 @@ def client_handler(sim: Simulator, conn: socket.socket, addr):
             if corrupted:
                 with sim.lock:
                     sim.corrupted_rx_count += 1
-                    sim.engine.fault_flags |= FaultFlag.CORRUPTED_PACKET
+                    sim.engine.note_corrupted_packet(time.monotonic())
             if packet is None:
                 break
             if not isinstance(packet, CommandPacket):

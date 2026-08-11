@@ -646,3 +646,75 @@ def test_zeroed_data_bus_is_not_misdiagnosed_as_a_frozen_imu():
     assert engine.mode != Mode.SAFE, (
         "a data-path fault must not command SAFE via a per-channel detector"
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: link-layer observations enter through the engine's own API (D6).
+# Transport reports what it OBSERVED; the engine decides what it MEANS.
+# ---------------------------------------------------------------------------
+
+def test_note_link_state_is_suppressed_during_boot():
+    """
+    "No ground station has connected yet" is normal during boot, not a fault --
+    the same class of cold-start false positive as the adaptive-baseline and
+    lockup warm-ups. The guard now lives inside the engine rather than at the
+    transport call site.
+    """
+    engine = FDIREngine()
+    engine.tick(make_sample(), 0.0)
+    assert engine.mode == Mode.BOOT
+
+    engine.note_link_state(0.0, connected=False, seconds_since_contact=None)
+    assert not (engine.fault_flags & FaultFlag.COMMS_LOSS), (
+        "never having been contacted during BOOT must not latch COMMS_LOSS"
+    )
+
+
+def test_note_link_state_latches_and_clears_using_config_timeout():
+    """
+    COMMS_LOSS is a live indicator, not a latching fault: reconnecting IS the
+    recovery, so there is no operator acknowledgement to wait for. It is
+    therefore deliberately absent from RESETTABLE_FLAGS.
+
+    The timeout must come from fdir/config.py -- it was previously hardcoded at
+    the transport call site while COMMS_LOSS_TIMEOUT_S sat entirely unused.
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    # Just inside the window: not yet a fault.
+    engine.note_link_state(now, connected=False,
+                           seconds_since_contact=cfg.COMMS_LOSS_TIMEOUT_S - 0.1)
+    assert not (engine.fault_flags & FaultFlag.COMMS_LOSS)
+
+    # At the window: latched.
+    engine.note_link_state(now, connected=False,
+                           seconds_since_contact=cfg.COMMS_LOSS_TIMEOUT_S)
+    assert engine.fault_flags & FaultFlag.COMMS_LOSS
+
+    # Contact restored: clears on its own, no RESET_FAULTS required.
+    engine.note_link_state(now, connected=True, seconds_since_contact=0.0)
+    assert not (engine.fault_flags & FaultFlag.COMMS_LOSS)
+
+
+def test_comms_loss_is_not_resettable_because_it_self_manages():
+    """RESET_FAULTS must not claim to clear a flag the link layer owns."""
+    from fdir.engine import RESETTABLE_FLAGS
+    assert not (FaultFlag.COMMS_LOSS & RESETTABLE_FLAGS)
+
+
+def test_note_corrupted_packet_latches_and_is_operator_clearable():
+    """
+    CORRUPTED_PACKET records that something happened rather than that something
+    is ongoing, so acknowledging it always clears it (COM-004).
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    engine.note_corrupted_packet(now)
+    assert engine.fault_flags & FaultFlag.CORRUPTED_PACKET
+    assert engine.mode == Mode.NOMINAL, "a corrupted packet must not command SAFE"
+
+    cleared, _still = engine.reset_faults(now)
+    assert cleared & FaultFlag.CORRUPTED_PACKET
+    assert not (engine.fault_flags & FaultFlag.CORRUPTED_PACKET)

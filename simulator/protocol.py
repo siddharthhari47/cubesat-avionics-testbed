@@ -6,45 +6,25 @@ from here so the two can never silently drift apart on packet format.
 """
 
 import struct
+import sys
 import zlib
 from dataclasses import dataclass, fields
-from enum import IntEnum, IntFlag
+from enum import IntEnum
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Mode/FaultFlag/HealthFlag are ICD vocabulary shared with fdir/ and any future
+# hardware driver -- they live in icd/ so that neither this module nor fdir/
+# has to import the other (see icd/__init__.py for the dual-class bug this
+# fixed). Re-exported here so `from protocol import FaultFlag` keeps working.
+from icd import FaultFlag, HealthFlag, Mode, RawSample  # noqa: E402,F401
 
 SYNC_BYTE = 0xA5
 
 PACKET_ID_TELEMETRY = 0x01
 PACKET_ID_COMMAND = 0x10
 PACKET_ID_ACK = 0x11
-
-
-class Mode(IntEnum):
-    BOOT = 0
-    NOMINAL = 1
-    SAFE = 2
-    TEST = 3
-
-
-class FaultFlag(IntFlag):
-    NONE = 0
-    SENSOR_TIMEOUT = 1 << 0
-    UNDERVOLTAGE_WARNING = 1 << 1
-    UNDERVOLTAGE_CRITICAL = 1 << 2
-    COMMS_LOSS = 1 << 3
-    CORRUPTED_PACKET = 1 << 4
-    ADAPTIVE_ANOMALY = 1 << 5
-    ML_ANOMALY = 1 << 6
-    WATCHDOG_RESET = 1 << 7
-    THERMAL_ANOMALY = 1 << 8
-    SENSOR_LOCKUP = 1 << 9
-
-
-class HealthFlag(IntFlag):
-    NONE = 0
-    TEMP_OK = 1 << 0
-    IMU_OK = 1 << 1
-    MAG_OK = 1 << 2
-    POWER_OK = 1 << 3
-    ALL_OK = TEMP_OK | IMU_OK | MAG_OK | POWER_OK
 
 
 class CommandId(IntEnum):

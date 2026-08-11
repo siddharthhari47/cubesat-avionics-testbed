@@ -34,8 +34,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "simulator"))
-from protocol import FaultFlag, HealthFlag, Mode  # noqa: E402
+# Imports the shared ICD vocabulary, NOT simulator/protocol.py. This module used
+# to path-hack into simulator/ for these enums, which meant the supposedly
+# hardware-agnostic FDIR package could not be imported without the simulator
+# present, formed an import cycle with simulator/environment.py, and produced two
+# distinct FaultFlag classes at runtime. See icd/__init__.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from icd import FaultFlag, HealthFlag, Mode, RawSample  # noqa: E402,F401
 
 from . import config as cfg
 
@@ -60,32 +65,6 @@ CONDITION_BACKED_FLAGS = (
 EVENT_FLAGS = FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET
 
 RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
-
-
-@dataclass
-class RawSample:
-    """
-    What FDIR is allowed to see. Physical observables only.
-
-    `imu_responded`/`temp_responded` model whether the sensor actually produced
-    a fresh reading this tick -- a real, physically observable I2C/SPI outcome
-    (an ACK or the lack of one), not a simulation ground-truth label.
-    """
-
-    temp_c: float
-    accel_x: float
-    accel_y: float
-    accel_z: float
-    gyro_x: float
-    gyro_y: float
-    gyro_z: float
-    mag_x: float
-    mag_y: float
-    mag_z: float
-    bus_voltage_v: float
-    bus_current_a: float
-    imu_responded: bool = True
-    temp_responded: bool = True
 
 
 @dataclass
@@ -336,6 +315,43 @@ class FDIREngine:
             if not self.fault_flags & FaultFlag.ML_ANOMALY:
                 self._emit(now, f"ML_ANOMALY latched (score={ml_advisory.score:.3f}, advisory only)")
             self.fault_flags |= FaultFlag.ML_ANOMALY
+
+    # ---- link-layer observations -------------------------------------------
+    # The transport reports what it OBSERVED; the engine decides what it MEANS.
+    # These exist because run_simulator.py used to reach in and write
+    # engine.fault_flags directly for COMMS_LOSS and CORRUPTED_PACKET (D6) --
+    # transport code mutating safety state, with the timeout hardcoded at the
+    # call site while fdir/config.py's COMMS_LOSS_TIMEOUT_S sat unused. Two of
+    # ten fault flags had no detector inside this engine, yet reset_faults()
+    # cleared them: the engine was clearing flags it could not observe.
+
+    def note_link_state(self, now: float, connected: bool,
+                        seconds_since_contact: Optional[float]) -> None:
+        """
+        Report ground-link state. Unlike the latching detectors, COMMS_LOSS is a
+        live indicator: reconnecting IS the recovery, so there is no operator
+        acknowledgement to wait for and it is deliberately absent from
+        RESETTABLE_FLAGS.
+        """
+        if self.mode == Mode.BOOT:
+            # "No ground station has connected yet" is normal during boot, not a
+            # fault. Same class of cold-start false positive as the adaptive
+            # baseline and lockup warm-ups.
+            return
+        if connected:
+            if self.fault_flags & FaultFlag.COMMS_LOSS:
+                self._emit(now, "COMMS_LOSS cleared (ground contact restored)")
+            self.fault_flags &= ~FaultFlag.COMMS_LOSS
+        elif seconds_since_contact is None or seconds_since_contact >= cfg.COMMS_LOSS_TIMEOUT_S:
+            if not self.fault_flags & FaultFlag.COMMS_LOSS:
+                self._emit(now, f"COMMS_LOSS latched (no ground contact for >= {cfg.COMMS_LOSS_TIMEOUT_S} s)")
+            self.fault_flags |= FaultFlag.COMMS_LOSS
+
+    def note_corrupted_packet(self, now: float) -> None:
+        """Report that the transport rejected a packet on integrity grounds (COM-004)."""
+        if not self.fault_flags & FaultFlag.CORRUPTED_PACKET:
+            self._emit(now, "CORRUPTED_PACKET latched (failed integrity check on receive)")
+        self.fault_flags |= FaultFlag.CORRUPTED_PACKET
 
     # ---- commands (operator-driven FDIR state transitions) -----------------
     # PING / GET_STATUS / SET_TELEMETRY_RATE / REQUEST_LOG don't touch FDIR
