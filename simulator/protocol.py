@@ -56,11 +56,17 @@ class AckStatus(IntEnum):
 
 # --- Telemetry packet ---------------------------------------------------
 
-_TM_FIELD_FORMAT = "<BBHIBHBH" + "f" * 12 + "I" + "HHHH"
+# fault_flags widened H->I and health_flags B->H (Phase 1b). Ten fault bits
+# are allocated and the planned fault-injection scenario set needs seven more,
+# which overflows uint16; health likewise needs RADIO/ADCS/BUS/OBC/BATTERY on
+# top of the four existing bits. Doing this now costs one afternoon; doing it
+# after V1 firmware exists costs an ICD change plus a firmware change plus a
+# ground-station change.
+_TM_FIELD_FORMAT = "<BBHIBIHH" + "f" * 12 + "I" + "HHHH"
 _TM_STRUCT = struct.Struct(_TM_FIELD_FORMAT)  # everything except the trailing checksum
 _TM_CHECKSUM_STRUCT = struct.Struct("<I")
 TELEMETRY_PACKET_SIZE = _TM_STRUCT.size + _TM_CHECKSUM_STRUCT.size
-assert TELEMETRY_PACKET_SIZE == 78, TELEMETRY_PACKET_SIZE
+assert TELEMETRY_PACKET_SIZE == 81, TELEMETRY_PACKET_SIZE
 
 
 @dataclass
@@ -89,7 +95,7 @@ class TelemetryPacket:
     corrupted_rx_count: int
 
     def pack(self) -> bytes:
-        payload_length = _TM_STRUCT.size - 14  # bytes from offset 14 (temp_c) onward, minus checksum
+        payload_length = _TM_STRUCT.size - 17  # bytes from offset 17 (temp_c) onward, minus checksum
         body = _TM_STRUCT.pack(
             SYNC_BYTE,
             PACKET_ID_TELEMETRY,

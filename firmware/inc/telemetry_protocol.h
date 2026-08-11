@@ -72,7 +72,7 @@ typedef enum {
 
 /* ==========================================================================
  * FaultFlag bits (simulator/protocol.py: class FaultFlag(IntFlag))
- * Wire field is uint16_t (telemetry-dictionary.md offset 9). Bits 10-15
+ * Wire field is uint32_t (telemetry-dictionary.md offset 9). Bits 10-31
  * reserved. Same reasoning as Mode_t applies -- plain #defines, not an enum,
  * so bitwise OR/AND of the uint16_t wire field needs no casts.
  *
@@ -83,7 +83,7 @@ typedef enum {
  * this bit gain autonomous authority in the C port either.
  * ======================================================================== */
 
-#define FAULT_NONE                      0x0000u
+#define FAULT_NONE                      0x00000000u
 #define FAULT_SENSOR_TIMEOUT            (1u << 0)   /* FDIR-002 */
 #define FAULT_UNDERVOLTAGE_WARNING      (1u << 1)   /* FDIR-003 */
 #define FAULT_UNDERVOLTAGE_CRITICAL     (1u << 2)   /* FDIR-003 */
@@ -98,11 +98,11 @@ typedef enum {
 
 /* ==========================================================================
  * HealthFlag bits (simulator/protocol.py: class HealthFlag(IntFlag))
- * Wire field is uint8_t (telemetry-dictionary.md offset 11). Bit set = that
- * sensor is healthy/responding. Bits 4-7 reserved.
+ * Wire field is uint16_t (telemetry-dictionary.md offset 13). Bit set = that
+ * sensor is healthy/responding. Bits 4-15 reserved.
  * ======================================================================== */
 
-#define HEALTH_NONE      0x00u
+#define HEALTH_NONE      0x0000u
 #define HEALTH_TEMP_OK   (1u << 0)
 #define HEALTH_IMU_OK    (1u << 1)
 #define HEALTH_MAG_OK    (1u << 2)
@@ -154,8 +154,8 @@ typedef enum {
  * __attribute__((packed)) is required, not cosmetic: without it, a
  * standards-conforming compiler is free to insert padding so multi-byte
  * fields land on their natural alignment. Concretely here, `mode` (uint8_t,
- * offset 8) would otherwise force a padding byte before `fault_flags`
- * (uint16_t) to align it to offset 10 instead of the wire format's offset 9
+ * offset 8) would otherwise force padding before `fault_flags`
+ * (uint32_t) to align it to offset 12 instead of the wire format's offset 9
  * -- silently shifting every field after it and desyncing from
  * simulator/protocol.py. GCC/arm-none-eabi-gcc (the STM32CubeIDE toolchain
  * per CLAUDE.md) supports this attribute; `#pragma pack(push,1)` is an
@@ -170,39 +170,44 @@ typedef enum {
 /**
  * TELEMETRY packet (spacecraft -> ground station).
  * Mirrors simulator/protocol.py TelemetryPacket / docs/interfaces/
- * telemetry-dictionary.md. Total size: 78 bytes.
+ * telemetry-dictionary.md. Total size: 81 bytes.
+ *
+ * Phase 1b widened fault_flags uint16->uint32 and health_flags uint8->uint16.
+ * Ten fault bits are allocated and the planned fault-injection scenario set
+ * needs seven more, which overflows uint16. Every offset from fault_flags
+ * onward shifted by +3 as a result.
  */
 typedef struct __attribute__((packed)) {
-    uint8_t  sync;                 /* offset  0: TM_SYNC_BYTE (0xA5) */
-    uint8_t  packet_id;            /* offset  1: TM_PACKET_ID_TELEMETRY (0x01) */
+    uint8_t  sync;                  /* offset  0: TM_SYNC_BYTE (0xA5) */
+    uint8_t  packet_id;             /* offset  1: TM_PACKET_ID_TELEMETRY (0x01) */
     uint16_t seq_num;               /* offset  2: increments every packet, wraps at 65535 */
     uint32_t timestamp_ms;          /* offset  4: mission elapsed time, ms since BOOT */
     uint8_t  mode;                  /* offset  8: Mode_t value */
-    uint16_t fault_flags;           /* offset  9: FAULT_* bitmask */
-    uint8_t  health_flags;          /* offset 11: HEALTH_* bitmask */
-    uint16_t payload_length;        /* offset 12: bytes from temp_c through corrupted_rx_count (60) */
-    float    temp_c;                /* offset 14: deg C, range -20..+60 */
-    float    accel_x;               /* offset 18: g, range +/-4 */
-    float    accel_y;               /* offset 22 */
-    float    accel_z;               /* offset 26 */
-    float    gyro_x;                /* offset 30: deg/s, range +/-500 */
-    float    gyro_y;                /* offset 34 */
-    float    gyro_z;                /* offset 38 */
-    float    mag_x;                 /* offset 42: microtesla, range +/-100 */
-    float    mag_y;                 /* offset 46 */
-    float    mag_z;                 /* offset 50 */
-    float    bus_voltage_v;         /* offset 54: volts, nominal ~5.0 (targets, TBD) */
-    float    bus_current_a;         /* offset 58: amps, range 0-2 */
-    uint32_t uptime_s;               /* offset 62: seconds since BOOT (not reset by mode-triggering reboot) */
-    uint16_t cmd_rx_count;           /* offset 66 */
-    uint16_t cmd_accept_count;       /* offset 68 */
-    uint16_t cmd_reject_count;       /* offset 70 */
-    uint16_t corrupted_rx_count;     /* offset 72: per COM-004 */
-    uint32_t checksum;               /* offset 74: CRC32 over bytes 0-73, see CRC32 NOTE above */
+    uint32_t fault_flags;           /* offset  9: FAULT_* bitmask */
+    uint16_t health_flags;          /* offset 13: HEALTH_* bitmask */
+    uint16_t payload_length;        /* offset 15: bytes from temp_c through corrupted_rx_count (60) */
+    float    temp_c;                /* offset 17: deg C, range -20..+60 */
+    float    accel_x;               /* offset 21: g, range +/-4 */
+    float    accel_y;               /* offset 25 */
+    float    accel_z;               /* offset 29 */
+    float    gyro_x;                /* offset 33: deg/s, range +/-500 */
+    float    gyro_y;                /* offset 37 */
+    float    gyro_z;                /* offset 41 */
+    float    mag_x;                 /* offset 45: microtesla, range +/-100 */
+    float    mag_y;                 /* offset 49 */
+    float    mag_z;                 /* offset 53 */
+    float    bus_voltage_v;         /* offset 57: volts, nominal ~5.0 (targets, TBD) */
+    float    bus_current_a;         /* offset 61: amps, range 0-2 */
+    uint32_t uptime_s;              /* offset 65: seconds since BOOT (not reset by mode-triggering reboot) */
+    uint16_t cmd_rx_count;          /* offset 69 */
+    uint16_t cmd_accept_count;      /* offset 71 */
+    uint16_t cmd_reject_count;      /* offset 73 */
+    uint16_t corrupted_rx_count;    /* offset 75: per COM-004 */
+    uint32_t checksum;              /* offset 77: CRC32 over bytes 0-76, see CRC32 NOTE above */
 } TelemetryPacket_t;
 
-_Static_assert(sizeof(TelemetryPacket_t) == 78,
-               "TelemetryPacket_t must be exactly 78 bytes to match simulator/protocol.py");
+_Static_assert(sizeof(TelemetryPacket_t) == 81,
+               "TelemetryPacket_t must be exactly 81 bytes to match simulator/protocol.py");
 
 /**
  * COMMAND packet (ground station -> spacecraft).

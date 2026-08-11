@@ -24,29 +24,31 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 2 | `seq_num` | uint16 | 2 | Increments every packet, wraps at 65535 |
 | 4 | `timestamp_ms` | uint32 | 4 | Mission elapsed time in ms since BOOT |
 | 8 | `mode` | uint8 | 1 | See Mode enum below |
-| 9 | `fault_flags` | uint16 | 2 | Bitmask, see Fault Flag Bits below |
-| 11 | `health_flags` | uint8 | 1 | Bitmask, see Health Flag Bits below |
-| 12 | `payload_length` | uint16 | 2 | Byte length of the sensor+stats payload (offset 14 through 73). Constant in V0 since there's only one packet shape; becomes meaningful once variable-length packets (e.g. log dumps) exist in V2 — included now per `COM-001` rather than retrofitted later |
-| 14 | `temp_c` | float32 | 4 | Degrees C, range -20 to +60 |
-| 18 | `accel_x` | float32 | 4 | g, range +/-4 |
-| 22 | `accel_y` | float32 | 4 | g, range +/-4 |
-| 26 | `accel_z` | float32 | 4 | g, range +/-4 |
-| 30 | `gyro_x` | float32 | 4 | deg/s, range +/-500 |
-| 34 | `gyro_y` | float32 | 4 | deg/s, range +/-500 |
-| 38 | `gyro_z` | float32 | 4 | deg/s, range +/-500 |
-| 42 | `mag_x` | float32 | 4 | microtesla, range +/-100 |
-| 46 | `mag_y` | float32 | 4 | microtesla, range +/-100 |
-| 50 | `mag_z` | float32 | 4 | microtesla, range +/-100 |
-| 54 | `bus_voltage_v` | float32 | 4 | Volts. Nominal ~5.0 V; warning <4.5 V, critical <4.0 V *(targets, TBD — see FDIR-003)* |
-| 58 | `bus_current_a` | float32 | 4 | Amps, range 0-2 |
-| 62 | `uptime_s` | uint32 | 4 | Seconds since BOOT (separate from `timestamp_ms`, which resets on mode-triggering reboot; uptime does not) |
-| 66 | `cmd_rx_count` | uint16 | 2 | Commands received since BOOT, wraps at 65535 |
-| 68 | `cmd_accept_count` | uint16 | 2 | Commands accepted |
-| 70 | `cmd_reject_count` | uint16 | 2 | Commands rejected |
-| 72 | `corrupted_rx_count` | uint16 | 2 | Corrupted packets received (failed integrity check), per `COM-004` |
-| 74 | `checksum` | uint32 | 4 | CRC32 (per Python `zlib.crc32`) over bytes 0-73 |
+| 9 | `fault_flags` | uint32 | 4 | Bitmask, see Fault Flag Bits below |
+| 13 | `health_flags` | uint16 | 2 | Bitmask, see Health Flag Bits below |
+| 15 | `payload_length` | uint16 | 2 | Byte length of the sensor+stats payload (offset 17 through 76) |
+| 17 | `temp_c` | float32 | 4 | Degrees C, range -20 to +60 |
+| 21 | `accel_x` | float32 | 4 | g, range +/-4 |
+| 25 | `accel_y` | float32 | 4 | g, range +/-4 |
+| 29 | `accel_z` | float32 | 4 | g, range +/-4 |
+| 33 | `gyro_x` | float32 | 4 | deg/s, range +/-500 |
+| 37 | `gyro_y` | float32 | 4 | deg/s, range +/-500 |
+| 41 | `gyro_z` | float32 | 4 | deg/s, range +/-500 |
+| 45 | `mag_x` | float32 | 4 | microtesla, range +/-100 |
+| 49 | `mag_y` | float32 | 4 | microtesla, range +/-100 |
+| 53 | `mag_z` | float32 | 4 | microtesla, range +/-100 |
+| 57 | `bus_voltage_v` | float32 | 4 | Volts. Nominal ~5.0 V; warning <4.5 V, critical <4.0 V *(targets, TBD — see FDIR-003)* |
+| 61 | `bus_current_a` | float32 | 4 | Amps, range 0-2 |
+| 65 | `uptime_s` | uint32 | 4 | Seconds since BOOT (separate from `timestamp_ms`, which resets on mode-triggering reboot; uptime does not) |
+| 69 | `cmd_rx_count` | uint16 | 2 | Commands received since BOOT, wraps at 65535 |
+| 71 | `cmd_accept_count` | uint16 | 2 | Commands accepted |
+| 73 | `cmd_reject_count` | uint16 | 2 | Commands rejected |
+| 75 | `corrupted_rx_count` | uint16 | 2 | Corrupted packets received (failed integrity check), per `COM-004` |
+| 77 | `checksum` | uint32 | 4 | CRC32 (per Python `zlib.crc32`) over bytes 0-76 |
 
-**Total packet size: 78 bytes.**
+**Total packet size: 81 bytes.**
+
+*Phase 1b widened `fault_flags` uint16 -> uint32 and `health_flags` uint8 -> uint16, shifting every offset from `fault_flags` onward by +3. Ten fault bits are allocated and the planned fault-injection scenario set needs seven more, which overflows uint16.*
 
 ## Mode enum (offset 8)
 
@@ -57,7 +59,7 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 2 | SAFE |
 | 3 | TEST |
 
-## Fault Flag Bits (offset 9, uint16 bitmask)
+## Fault Flag Bits (offset 9, uint32 bitmask)
 
 | Bit | Flag | Requirement |
 |---|---|---|
@@ -71,9 +73,9 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 7 | Last reset was watchdog-triggered | — |
 | 8 | Thermal anomaly | FDIR-009 |
 | 9 | Sensor lockup (stuck/frozen reading, distinct from timeout) | FDIR-010 |
-| 10-15 | Reserved | — |
+| 10-31 | Reserved | — |
 
-## Health Flag Bits (offset 11, uint8 bitmask)
+## Health Flag Bits (offset 13, uint16 bitmask)
 
 Bit set = that sensor is healthy/responding.
 
@@ -83,4 +85,4 @@ Bit set = that sensor is healthy/responding.
 | 1 | IMU (accel/gyro) |
 | 2 | Magnetometer |
 | 3 | Power monitor |
-| 4-7 | Reserved |
+| 4-15 | Reserved |

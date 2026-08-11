@@ -4,7 +4,7 @@ docs/interfaces/telemetry-dictionary.md and docs/interfaces/command-dictionary.m
 
 Covers:
   - pack() -> unpack() round-trips preserve every field, for all three packet types.
-  - Packet sizes match the ICD exactly (78 / 13 / 10 bytes).
+  - Packet sizes match the ICD exactly (81 / 13 / 10 bytes).
   - A single flipped byte in a packed telemetry packet is caught by the CRC32
     checksum and unpack() returns None.
   - read_packet()'s resync behavior: garbage bytes preceding a valid packet on a
@@ -103,12 +103,12 @@ def _assert_fields_equal(original, roundtripped) -> None:
             )
 
 
-# --- Packet sizes (ICD: 78 / 13 / 10 bytes) -----------------------------------
+# --- Packet sizes (ICD: 81 / 13 / 10 bytes) -----------------------------------
 
 
 class TestPacketSizes:
     def test_telemetry_packet_size_is_78_bytes(self):
-        assert TELEMETRY_PACKET_SIZE == 78
+        assert TELEMETRY_PACKET_SIZE == 81
 
     def test_command_packet_size_is_13_bytes(self):
         assert COMMAND_PACKET_SIZE == 13
@@ -117,7 +117,7 @@ class TestPacketSizes:
         assert ACK_PACKET_SIZE == 10
 
     def test_packed_telemetry_bytes_match_declared_size(self, telemetry_packet):
-        assert len(telemetry_packet.pack()) == TELEMETRY_PACKET_SIZE == 78
+        assert len(telemetry_packet.pack()) == TELEMETRY_PACKET_SIZE == 81
 
     def test_packed_command_bytes_match_declared_size(self, command_packet):
         assert len(command_packet.pack()) == COMMAND_PACKET_SIZE == 13
@@ -221,7 +221,7 @@ class TestChecksumCatchesCorruption:
         data[20] ^= 0xFF
         assert TelemetryPacket.unpack(bytes(data)) is None
 
-    @pytest.mark.parametrize("byte_offset", list(range(78)))
+    @pytest.mark.parametrize("byte_offset", list(range(81)))
     def test_flipping_any_single_byte_is_detected(self, telemetry_packet, byte_offset):
         """Every byte position matters to the checksum -- flip each one in turn
         and confirm corruption is always caught. (A CRC32 does not guarantee
@@ -365,3 +365,56 @@ class TestPacketIdentifiers:
 
     def test_sync_byte_matches_icd(self):
         assert SYNC_BYTE == 0xA5
+
+
+# ---------------------------------------------------------------------------
+# Phase 1b: the widened flag fields. These tests pin the capability the
+# widening was for -- not just the new packet size.
+# ---------------------------------------------------------------------------
+
+class TestWidenedFlagFields:
+    def test_fault_flags_carries_more_than_16_bits(self, telemetry_packet):
+        """
+        The reason for widening: ten fault bits are allocated and the planned
+        fault-injection scenario set needs seven more, which overflows uint16.
+        A 17th bit must survive the wire.
+        """
+        telemetry_packet.fault_flags = 1 << 16
+        roundtripped = TelemetryPacket.unpack(telemetry_packet.pack())
+        assert roundtripped is not None
+        assert roundtripped.fault_flags == 1 << 16
+
+    def test_fault_flags_carries_full_32_bit_range(self, telemetry_packet):
+        telemetry_packet.fault_flags = 0xFFFFFFFF
+        roundtripped = TelemetryPacket.unpack(telemetry_packet.pack())
+        assert roundtripped.fault_flags == 0xFFFFFFFF
+
+    def test_health_flags_carries_more_than_8_bits(self, telemetry_packet):
+        """Health needs RADIO/ADCS/BUS/OBC/BATTERY on top of the existing four."""
+        telemetry_packet.health_flags = 1 << 8
+        roundtripped = TelemetryPacket.unpack(telemetry_packet.pack())
+        assert roundtripped.health_flags == 1 << 8
+
+    def test_wire_offsets_match_the_icd_document(self):
+        """
+        Guards the exact drift that made this change expensive to verify: the
+        ICD table, simulator/protocol.py and firmware/inc/telemetry_protocol.h
+        must agree on every offset. This asserts the first two; the C header is
+        cross-checked by mirroring it in ctypes (see the header's own comment).
+        """
+        import re
+        import struct
+        from pathlib import Path
+
+        doc = (Path(__file__).resolve().parent.parent
+               / "docs" / "interfaces" / "telemetry-dictionary.md").read_text(encoding="utf-8")
+        documented = [int(o) for o, _ in re.findall(r"^\| (\d+) \| \`(\w+)\`", doc, re.M)]
+
+        fmts = ["B", "B", "H", "I", "B", "I", "H", "H"] + ["f"] * 12 + ["I", "H", "H", "H", "H", "I"]
+        actual, off = [], 0
+        for f in fmts:
+            actual.append(off)
+            off += struct.calcsize("<" + f)
+
+        assert documented == actual, "telemetry-dictionary.md offsets have drifted from protocol.py"
+        assert off == TELEMETRY_PACKET_SIZE
