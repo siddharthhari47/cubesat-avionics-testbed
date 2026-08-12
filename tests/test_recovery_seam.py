@@ -193,13 +193,16 @@ def test_power_cycle_respects_the_dwell_time():
     # The flag must latch first (COMMS_LOSS_TIMEOUT_S), and only then does the
     # recovery trigger start counting -- so run until the action completes
     # rather than guessing a tick count.
-    budget = int((cfg.COMMS_LOSS_TIMEOUT_S + cfg.COMMS_RECOVERY_TRIGGER_S) / DT) + 100
+    budget = int((cfg.COMMS_LOSS_TIMEOUT_S + cfg.COMMS_RECOVERY_TRIGGER_S) / DT) + 400
     for _ in range(budget):
         h.tick()
-        if any(r.completed_at is not None for r in h.executor.history):
+        if any(r.completed_at is not None and r.intent.action == RecoveryAction.POWER_CYCLE
+               for r in h.executor.history):
             break
 
-    completed = [r for r in h.executor.history if r.completed_at is not None]
+    completed = [r for r in h.executor.history
+                 if r.completed_at is not None
+                 and r.intent.action == RecoveryAction.POWER_CYCLE]
     assert completed, "a power cycle should have completed"
     record = completed[0]
     off_duration = record.completed_at - record.started_at
@@ -240,23 +243,3 @@ def test_unavailable_port_reports_failure_rather_than_pretending(monkeypatch):
     assert "unavailable" in h.executor.history[-1].detail
 
 
-def test_kysat2_case_action_executes_correctly_and_achieves_nothing():
-    """
-    The KySat-2 shape: the recovery action runs, the port accepts it, and the
-    fault persists anyway (physically a latch upstream of the switch).
-
-    Phase 3 deliberately does NOT detect this -- verifying that an action
-    achieved something, bounding retries and escalating are Phase 5. This test
-    pins the current, honest behaviour so Phase 5 has a baseline to change:
-    right now the executor records success on a cycle that fixed nothing, which
-    is exactly the gap KySat-2 died in.
-    """
-    h = Harness(seed=19, latch_clears=False)
-    h.boot()
-    h.env.inject("radio_latchup")
-    sample, truth = h.run(int(cfg.COMMS_RECOVERY_TRIGGER_S / DT) + 60)
-
-    assert h.executor.attempts_for(RecoveryAction.POWER_CYCLE, int(Rail.RADIO)) >= 1
-    assert h.executor.history[-1].accepted is True, "the port accepted the command"
-    assert truth.rail_latched[int(Rail.RADIO)] is True, "yet the fault persists"
-    assert sample.radio_responded is False

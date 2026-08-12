@@ -79,6 +79,16 @@ COMMS_RECOVERY_TRIGGER_S = 30.0
 # the part, to be measured rather than assumed.
 POWER_CYCLE_OFF_TIME_S = 0.150
 
+# After an action completes, how long to OBSERVE before deciding whether it
+# achieved anything. A recovery is not verified by the port accepting the
+# command -- that conflation is the KySat-2 failure. Long enough for a
+# device to re-enumerate and for telemetry to reflect reality.
+RECOVERY_VERIFY_WINDOW_S = 2.0
+
+# A rail is considered back in its expected band below this draw. Coarse on
+# purpose -- it separates "latched" from "nominal", not fine gradations.
+RAIL_NOMINAL_CURRENT_CEILING_A = 0.25
+
 # --- reset evidence (D2) -------------------------------------------------------
 # RESET_FAULTS may only clear a latched flag on POSITIVE evidence that the
 # condition has gone away -- this many consecutive non-breaching observations --

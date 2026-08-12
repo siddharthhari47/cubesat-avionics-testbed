@@ -73,7 +73,8 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 7 | Last reset was watchdog-triggered | — |
 | 8 | Thermal anomaly | FDIR-009 |
 | 9 | Sensor lockup (stuck/frozen reading, distinct from timeout) | FDIR-010 |
-| 10-31 | Reserved | — |
+| 10 | Recovery campaign exhausted every rung without verification | R3 |
+| 11-31 | Reserved | — |
 
 ## Health Flag Bits (offset 13, uint16 bitmask)
 

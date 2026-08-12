@@ -94,7 +94,8 @@ typedef enum {
 #define FAULT_WATCHDOG_RESET            (1u << 7)
 #define FAULT_THERMAL_ANOMALY           (1u << 8)   /* FDIR-009 */
 #define FAULT_SENSOR_LOCKUP             (1u << 9)   /* FDIR-010 */
-/* bits 10-15 reserved */
+#define FAULT_RECOVERY_FAILED           (1u << 10)  /* escalation exhausted */
+/* bits 11-31 reserved */
 
 /* ==========================================================================
  * HealthFlag bits (simulator/protocol.py: class HealthFlag(IntFlag))

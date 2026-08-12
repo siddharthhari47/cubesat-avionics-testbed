@@ -95,6 +95,11 @@ class FaultFlag(IntFlag):
     WATCHDOG_RESET = 1 << 7
     THERMAL_ANOMALY = 1 << 8
     SENSOR_LOCKUP = 1 << 9
+    # Set when an escalating recovery campaign has exhausted every rung
+    # without its verification condition being met. Autonomy stands down;
+    # the spacecraft holds and waits for the ground. Uses bit 10, which
+    # only exists because Phase 1b widened this field past uint16.
+    RECOVERY_FAILED = 1 << 10
 
 
 class HealthFlag(IntFlag):

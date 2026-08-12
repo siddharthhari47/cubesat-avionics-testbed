@@ -44,6 +44,7 @@ from icd import FaultFlag, HealthFlag, Mode, Rail, RawSample  # noqa: E402,F401
 
 from . import config as cfg
 from .ports import RecoveryAction, RecoveryIntent
+from .recovery import Campaign, CampaignState, VerifyCondition, comms_loss_ladder
 
 # Faults allowed to autonomously force NOMINAL/TEST -> SAFE. Deliberately
 # excludes ADAPTIVE_ANOMALY (a *statistical* detector, kept advisory-only since
@@ -151,7 +152,7 @@ class FDIREngine:
         # anything itself -- see fdir/ports.py for why the seam is here.
         self.pending_intents: List[RecoveryIntent] = []
         self._comms_loss_since: Optional[float] = None
-        self._comms_intent_issued = False
+        self.campaign: Optional[Campaign] = None
 
     # ---- lifecycle -------------------------------------------------
 
@@ -215,7 +216,7 @@ class FDIREngine:
             self.mode = Mode.SAFE
             self._emit(now, f"-> SAFE: {FaultFlag(self.fault_flags & SAFE_MODE_TRIGGER_FLAGS)!r}")
 
-        self._update_recovery_proposals(now)
+        self._update_recovery_proposals(now, sample)
 
     # ---- individual detectors -------------------------------------------------
     # Each latches its FaultFlag bit once its debounce window is satisfied, and
@@ -397,36 +398,199 @@ class FDIREngine:
         self._emit(now, f"recovery proposed: {action.name} on device {target} ({reason})")
         return True
 
-    def _update_recovery_proposals(self, now: float) -> None:
+    def _verification_met(self, condition: VerifyCondition, sample: RawSample) -> bool:
         """
-        The CSSWE rule, and currently the only producer.
+        Did the action achieve anything? Answered from telemetry only.
 
-        Loss of ground contact is treated as a fault condition with an
+        Note what is NOT consulted: whether the executor said the command
+        succeeded. "The port accepted it" is not evidence the fault cleared --
+        that conflation is the KySat-2 failure exactly.
+        """
+        if condition == VerifyCondition.RADIO_RESPONSIVE:
+            return bool(sample.radio_responded)
+        if condition == VerifyCondition.IMU_RESPONSIVE:
+            return bool(sample.imu_responded)
+        if condition == VerifyCondition.RAIL_CURRENT_NOMINAL:
+            rung = self.campaign.current_rung if self.campaign else None
+            if rung is None or not sample.rail_current_a:
+                return False
+            draw = sample.rail_current_a.get(int(rung.target))
+            return draw is not None and draw < cfg.RAIL_NOMINAL_CURRENT_CEILING_A
+        return False
+
+    def _start_campaign(self, now: float, trigger: FaultFlag, rungs, reason: str) -> bool:
+        if not (trigger & RECOVERY_AUTHORITY_FLAGS):
+            self._emit(now, f"campaign REFUSED ({reason}): "
+                            f"{FaultFlag(trigger)!r} carries no recovery authority")
+            return False
+        self.campaign = Campaign(trigger=int(trigger), rungs=list(rungs), started_at=now)
+        self._emit(now, f"recovery campaign opened ({reason}), {len(rungs)} rungs")
+        return True
+
+    def _advance_campaign(self, now: float, sample: RawSample) -> None:
+        """
+        The bounded/verified/escalating loop. One transition per tick.
+
+        IDLE     -> issue the current rung's intent, go ACTING
+        ACTING   -> (executor reports completion) go VERIFYING with a deadline
+        VERIFYING-> condition met      -> SUCCEEDED
+                    deadline expired   -> count the attempt; retry the rung if
+                                          it has attempts left, else escalate;
+                                          if no rungs remain -> EXHAUSTED
+        """
+        c = self.campaign
+        if c is None or c.finished:
+            return
+
+        if c.state == CampaignState.IDLE:
+            rung = c.current_rung
+            if rung is None:
+                self._exhaust_campaign(now)
+                return
+            self.pending_intents.append(RecoveryIntent(
+                action=rung.action, target=rung.target,
+                reason=f"rung {c.rung_index}: {rung.description}",
+                requested_at=now, attempt=c.attempts_on_rung + 1,
+            ))
+            c.state = CampaignState.ACTING
+            self._emit(now, f"recovery rung {c.rung_index} attempt "
+                            f"{c.attempts_on_rung + 1}/{rung.max_attempts}: {rung.description}")
+            return
+
+        if c.state == CampaignState.VERIFYING:
+            rung = c.current_rung
+            if rung is not None and self._verification_met(rung.verify, sample):
+                c.state = CampaignState.SUCCEEDED
+                self._emit(now, f"recovery VERIFIED at rung {c.rung_index} "
+                                f"({rung.verify.name}) after {c.total_attempts} attempt(s)")
+                return
+            if c.verify_deadline is not None and now >= c.verify_deadline:
+                self._on_verification_failed(now)
+
+    def _on_verification_failed(self, now: float) -> None:
+        c = self.campaign
+        rung = c.current_rung
+        self._emit(now, f"recovery rung {c.rung_index} attempt {c.attempts_on_rung} "
+                        f"NOT VERIFIED ({rung.verify.name if rung else '?'})")
+        if rung is not None and c.attempts_on_rung < rung.max_attempts:
+            c.state = CampaignState.IDLE          # retry the same rung, still bounded
+            return
+        c.rung_index += 1
+        c.attempts_on_rung = 0
+        if c.current_rung is None:
+            self._exhaust_campaign(now)
+        else:
+            c.state = CampaignState.IDLE
+            self._emit(now, f"escalating to rung {c.rung_index}: {c.current_rung.description}")
+
+    def _exhaust_campaign(self, now: float) -> None:
+        c = self.campaign
+        c.state = CampaignState.EXHAUSTED
+        self.fault_flags |= FaultFlag.RECOVERY_FAILED
+        self._emit(now, f"RECOVERY_FAILED: every rung exhausted after "
+                        f"{c.total_attempts} attempt(s); autonomy standing down")
+
+    def note_action_completed(self, now: float, accepted: bool) -> None:
+        """
+        Called by the executor when an action finishes. Starts the observation
+        window; it does NOT decide success. Whether the fault actually cleared
+        is re-observed from telemetry during VERIFYING.
+        """
+        c = self.campaign
+        if c is None or c.state != CampaignState.ACTING:
+            return
+        c.attempts_on_rung += 1
+        c.total_attempts += 1
+        c.state = CampaignState.VERIFYING
+        c.verify_deadline = now + cfg.RECOVERY_VERIFY_WINDOW_S
+        self._emit(now, f"action complete (port accepted={accepted}); "
+                        f"verifying for {cfg.RECOVERY_VERIFY_WINDOW_S} s")
+
+    def _update_recovery_proposals(self, now: float, sample: RawSample) -> None:
+        """
+        The CSSWE rule: loss of ground contact is a fault condition with an
         autonomous response, because the one thing the ground cannot fix is the
-        radio it would have to talk through. Note the trigger is
-        COMMS_RECOVERY_TRIGGER_S, NOT the COMMS_LOSS_TIMEOUT_S heartbeat --
-        flagging the loss and acting on it are deliberately different timescales.
+        radio it would have to talk through.
 
-        Bounded retries, verification of the outcome and escalation when it
-        fails are Phase 5. This proposes once per loss episode so it cannot spam,
-        which is a placeholder for that policy, not a substitute for it.
+        The trigger is COMMS_RECOVERY_TRIGGER_S, NOT the COMMS_LOSS_TIMEOUT_S
+        heartbeat -- flagging the loss and acting on it are different
+        timescales, and conflating them would power-cycle the radio every five
+        seconds.
         """
+        if self.campaign is not None and not self.campaign.finished:
+            self._advance_campaign(now, sample)
+            return
+
         if not self.fault_flags & FaultFlag.COMMS_LOSS:
             self._comms_loss_since = None
-            self._comms_intent_issued = False
+            # The finished campaign is deliberately KEPT rather than nulled.
+            # Discarding it on recovery would erase the only structured record
+            # that a recovery happened and was verified -- the log survives, but
+            # the outcome, rung reached and attempt count would not. A new loss
+            # episode is distinguished by its start time below, not by wiping it.
             return
+
+        if self.campaign is not None and self.campaign.finished:
+            started_this_episode = (
+                self._comms_loss_since is not None
+                and self.campaign.started_at >= self._comms_loss_since
+            )
+            if started_this_episode:
+                # Already tried everything for THIS episode; stand down. Trying
+                # again on the same unbroken loss would be the blind repetition
+                # R3 forbids.
+                return
+            # Otherwise the campaign belongs to an earlier, resolved episode and
+            # a genuinely new one may open below.
+
         if self._comms_loss_since is None:
             self._comms_loss_since = now
             return
-        if self._comms_intent_issued:
-            return
         if now - self._comms_loss_since >= cfg.COMMS_RECOVERY_TRIGGER_S:
-            issued = self._propose(
-                now, RecoveryAction.POWER_CYCLE, int(Rail.RADIO),
-                FaultFlag.COMMS_LOSS,
+            self._start_campaign(
+                now, FaultFlag.COMMS_LOSS, comms_loss_ladder(int(Rail.RADIO)),
                 f"no ground contact for >= {cfg.COMMS_RECOVERY_TRIGGER_S} s",
             )
-            self._comms_intent_issued = issued
+
+    # ---- campaign persistence (state only -- the engine performs no I/O) ----
+
+    def export_recovery_state(self) -> Optional[dict]:
+        """Snapshot for non-volatile storage. Written BEFORE an action executes."""
+        return None if self.campaign is None else self.campaign.to_dict()
+
+    def import_recovery_state(self, state: Optional[dict], now: float) -> None:
+        """
+        Restore after a reset. This is what stops KySat-2's loop: without it a
+        reboot mid-campaign restarts at rung 0 with the attempt counter at zero,
+        forever.
+
+        A campaign restored mid-action resumes at the NEXT rung, not the one it
+        was on -- we cannot know whether the interrupted action completed, and
+        re-running it would be the blind repetition R3 forbids.
+        """
+        if not state:
+            return
+        try:
+            campaign = Campaign.from_dict(state)
+        except (KeyError, ValueError) as exc:
+            self._emit(now, f"recovery state discarded (unreadable: {exc})")
+            return
+        if campaign.finished:
+            self.campaign = campaign
+            self._emit(now, "restored a finished recovery campaign; not resuming")
+            return
+        campaign.rung_index += 1
+        campaign.attempts_on_rung = 0
+        campaign.verify_deadline = None
+        if campaign.current_rung is None:
+            self.campaign = campaign
+            self._exhaust_campaign(now)
+            return
+        campaign.state = CampaignState.IDLE
+        self.campaign = campaign
+        self._emit(now, f"recovery campaign resumed after reset at rung "
+                        f"{campaign.rung_index} ({campaign.current_rung.description}); "
+                        f"{campaign.total_attempts} prior attempt(s) remembered")
 
     def take_pending_intents(self) -> List[RecoveryIntent]:
         """Drain the queue. The executor calls this; nothing else should."""
