@@ -13,7 +13,9 @@ states plainly what this review is and is not.
 > including one HIGH that defeats R5 outright: the spacecraft cannot notice a silent
 > link failure, so the entire CSSWE recovery ladder is gated behind a flag that never
 > latches. Two of my own earlier concerns were **refuted by measurement** and are
-> recorded as such. Round 2 findings are reported, not yet fixed.
+> recorded as such. **Round 2 is now fixed too — ten findings, all ten closed, 288
+> tests.** Fixing K1 then revealed that `COMMS_LOSS_TIMEOUT_S` had never once been
+> exercised by any test or scenario; see §7.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -579,9 +581,77 @@ are public mutable lists, and a caller can append to them directly. Nothing does
 
 ---
 
+### Round 2 resolution — all fixed
+
+| # | Fix | Verified by |
+|---|---|---|
+| J1 | The heartbeat, and only the heartbeat, decides contact. `link_established` is recorded for the log message but does not gate the decision | live A/B over the real transport (below) |
+| K1 | The environment reports contact *age* always, instead of `None` whenever the link was healthy — the same evidence `last_client_seen` produces | a scenario can now express "link open but silent" at all |
+| G1 | `_status_name()` renders an unknown status instead of raising; the read loop catches `Exception`, so one bad packet costs a reconnect not the thread | `_status_name(0x08) == "UNKNOWN_STATUS(0x08)"` |
+| G2 | `_mode_name()` in `timeline.py`, and the dashboard falls back to `UNKNOWN (99)` | `build_timeline` survives a mode-99 packet |
+| G3 | `GroundLink` counts corrupted frames and decode errors, surfaced in the dashboard | counters in `snapshot()` |
+| G4 | `payload_length` is validated on receive | mismatched length rejects the packet |
+
+**Live A/B, both ends real:**
+
+```
+ground station RECEIVING but never transmitting (the J1 case):
+  packets: 119   with COMMS_LOSS: 70   -> latched after ~4.9 s of silence
+ground station with the 1 Hz heartbeat (normal operation):
+  packets: 119   with COMMS_LOSS: 0    -> never latched
+```
+
+4.9 s against a configured `COMMS_LOSS_TIMEOUT_S` of 5.0 s, and a healthy link stays
+clean. The spacecraft can now tell a live link from a dead one.
+
+#### The heartbeat is a real addition, not just a bug fix
+
+J1 could not be fixed by correcting the transport alone. Telemetry is downlink-only and
+the operator sends commands by hand, so **there was no periodic uplink at all** — the
+`seconds_since_contact` field existed and nothing ever produced a meaningful value for
+it. `GroundLink` now sends a 1 Hz `PING` (already in the command dictionary, no side
+effects, acks suppressed from the operator log). Without it, making the engine respect
+the heartbeat would have latched `COMMS_LOSS` on every healthy idle link — a worse
+failure than the one being fixed.
+
+#### My first attempt at J1 was wrong
+
+I initially wrote `in_contact = link_established and not stale`, which broke
+`test_note_link_state_latches_and_clears_using_config_timeout`. The test was right and
+I was wrong: `link_established=False` with contact 4.9 s ago must *not* latch, because a
+TCP reconnect or radio handover drops the transport while contact is fine. The timeout
+*is* the grace period.
+
+That forced the sharper rule: `link_established` is unreliable in **both** directions —
+True proves nothing (J1), False does not yet prove loss — so the heartbeat alone decides.
+Simpler than what I first wrote, and correct in a case I had not considered.
+
+#### And fixing K1 revealed the comms timeout had never once run
+
+`last_ground_contact_t` was initialised to 0.0 and advanced by nothing —
+`note_ground_contact()` existed with no callers. So `seconds_since_ground_contact` was
+really *seconds since boot*, already past the 5 s timeout before any fault was injected.
+**`COMMS_LOSS` latched instantly on every link drop in every test and every scenario, and
+`COMMS_LOSS_TIMEOUT_S` was never exercised by anything.**
+
+It surfaced as `test_csswe_radio_latchup_recovers_autonomously` failing with 0 power
+cycles: with the debounce genuinely running, the ladder now starts 5 s later than the
+test's tick budget allowed. The budget was raised and
+`test_the_comms_timeout_is_actually_exercised` now pins the measured latch delay against
+the configured value.
+
+This is the third instance of the same pattern — a test passing because of a defect
+rather than in spite of one. F2's R4 assertion, K1's verdict-shaped evidence, and now a
+debounce that never ran.
+
 ### Standing after both rounds
 
-Ten findings, six fixed, four open (G1, J1, K1 and the G2–G4 group). Every dimension
-originally planned has now been run. What has *not* been done is an independent
-adversarial pass over these conclusions — both rounds were a single reviewer who wrote
-most of the code, and that limitation from §5 is unchanged.
+**Ten findings, all ten fixed.** Every dimension originally planned has been run.
+Suite: 249 → **288 passing** (39 regression tests). Scenario outcome distribution
+unchanged and negative assertions still clean.
+
+What has *not* been done is an independent adversarial pass over these conclusions —
+both rounds were a single reviewer who wrote most of the code, and that limitation from
+§5 is unchanged. Three of the ten findings were only found because fixing something
+else disturbed them, which is weak evidence that a genuinely independent pass would
+still find more.

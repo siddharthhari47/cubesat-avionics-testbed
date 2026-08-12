@@ -683,7 +683,7 @@ def test_note_link_state_is_suppressed_during_boot():
     engine.tick(make_sample(), 0.0)
     assert engine.mode == Mode.BOOT
 
-    engine.note_link_state(0.0, connected=False, seconds_since_contact=None)
+    engine.note_link_state(0.0, link_established=False, seconds_since_contact=None)
     assert not (engine.fault_flags & FaultFlag.COMMS_LOSS), (
         "never having been contacted during BOOT must not latch COMMS_LOSS"
     )
@@ -702,17 +702,17 @@ def test_note_link_state_latches_and_clears_using_config_timeout():
     now = drive_to_nominal(engine)
 
     # Just inside the window: not yet a fault.
-    engine.note_link_state(now, connected=False,
+    engine.note_link_state(now, link_established=False,
                            seconds_since_contact=cfg.COMMS_LOSS_TIMEOUT_S - 0.1)
     assert not (engine.fault_flags & FaultFlag.COMMS_LOSS)
 
     # At the window: latched.
-    engine.note_link_state(now, connected=False,
+    engine.note_link_state(now, link_established=False,
                            seconds_since_contact=cfg.COMMS_LOSS_TIMEOUT_S)
     assert engine.fault_flags & FaultFlag.COMMS_LOSS
 
     # Contact restored: clears on its own, no RESET_FAULTS required.
-    engine.note_link_state(now, connected=True, seconds_since_contact=0.0)
+    engine.note_link_state(now, link_established=True, seconds_since_contact=0.0)
     assert not (engine.fault_flags & FaultFlag.COMMS_LOSS)
 
 

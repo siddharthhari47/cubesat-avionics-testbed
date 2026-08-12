@@ -71,11 +71,17 @@ def live_dashboard():
         st.info("Connected, waiting for the first telemetry packet...")
         return
 
-    mode = proto.Mode(latest.mode)
+    # G2: an out-of-range mode from a buggy firmware build must not take the
+    # dashboard down with it.
+    try:
+        mode = proto.Mode(latest.mode)
+        mode_label, mode_colour = mode.name, MODE_COLOR[mode]
+    except ValueError:
+        mode_label, mode_colour = f"UNKNOWN ({latest.mode})", "orange"
     active_faults = [f.name for f in proto.FaultFlag if f != proto.FaultFlag.NONE and latest.fault_flags & f]
     unhealthy = [h.name for h in proto.HealthFlag if h not in (proto.HealthFlag.NONE, proto.HealthFlag.ALL_OK) and not (latest.health_flags & h)]
 
-    st.markdown(f"### Mode: :{MODE_COLOR[mode]}[{mode.name}]")
+    st.markdown(f"### Mode: :{mode_colour}[{mode_label}]")
     if active_faults:
         # Split by AUTHORITY, not just by "is it set". Rendering an advisory
         # anomaly identically to a flag that can command SAFE made the
@@ -118,6 +124,14 @@ def live_dashboard():
     st.caption(
         f"cmds rx={latest.cmd_rx_count} accepted={latest.cmd_accept_count} "
         f"rejected={latest.cmd_reject_count} corrupted={latest.corrupted_rx_count}"
+    )
+    # G3: link quality measured at the GROUND end. Packet loss is one of the
+    # five numbers this project must produce, and read_packet's corruption
+    # signal was previously discarded without ever being counted.
+    st.caption(
+        f"downlink: {snap['corrupted_rx_count']} corrupted frame(s), "
+        f"{snap['decode_error_count']} decode error(s)"
+        + (f" -- last: {snap['last_decode_error']}" if snap['last_decode_error'] else "")
     )
 
     with st.container(border=True):

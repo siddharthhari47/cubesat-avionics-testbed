@@ -74,6 +74,19 @@ class TimelineEvent:
         return "info"
 
 
+def _mode_name(value: int) -> str:
+    """
+    G2: `Mode(value).name` raises ValueError on an out-of-range mode, and a
+    single CRC-valid packet carrying one crashed the whole timeline -- and the
+    dashboard with it. A viewer is far better served by "mode 99" than by a
+    stack trace.
+    """
+    try:
+        return Mode(value).name
+    except ValueError:
+        return f"mode {value}"
+
+
 def _t(pkt, first_ms: int) -> float:
     """
     Seconds since the first buffered packet.
@@ -98,13 +111,13 @@ def build_timeline(packets: Sequence) -> List[TimelineEvent]:
     for pkt in packets:
         t = _t(pkt, first_ms)
         if prev is None:
-            events.append(TimelineEvent(t, "mode", f"start in {Mode(pkt.mode).name}"))
+            events.append(TimelineEvent(t, "mode", f"start in {_mode_name(pkt.mode)}"))
             prev = pkt
             continue
 
         if pkt.mode != prev.mode:
             events.append(TimelineEvent(
-                t, "mode", f"{Mode(prev.mode).name} -> {Mode(pkt.mode).name}"))
+                t, "mode", f"{_mode_name(prev.mode)} -> {_mode_name(pkt.mode)}"))
 
         # timestamp going backwards is the reboot signature -- surface it rather
         # than letting it silently corrupt the axis.

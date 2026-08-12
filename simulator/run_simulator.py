@@ -144,11 +144,32 @@ class Simulator:
         # what that means, applies the BOOT guard, and owns the timeout from
         # fdir/config.py. This used to write engine.fault_flags directly with a
         # hardcoded 5.0 while config's COMMS_LOSS_TIMEOUT_S went unused (D6).
+        # J1: report EVIDENCE, not a verdict. `self.conn is not None` says a
+        # socket object exists, which is not the same as anything being on the
+        # other end -- on a half-open link recv blocks forever and this stayed
+        # True indefinitely. The engine now requires BOTH a transport link and
+        # something heard within the timeout, so last_seen is load-bearing
+        # rather than decorative.
         with self.conn_lock:
-            connected = self.conn is not None
+            link_established = self.conn is not None
             last_seen = self.last_client_seen
         seconds_since_contact = None if last_seen is None else now - last_seen
-        self.engine.note_link_state(now, connected, seconds_since_contact)
+        self.engine.note_link_state(now, link_established, seconds_since_contact)
+
+    def note_link_failure(self, conn) -> None:
+        """
+        A send failed, so the link is gone. Tear it down.
+
+        This used to be `except OSError: pass` in telemetry_loop -- discarding
+        the single strongest piece of evidence available that contact is lost,
+        and leaving self.conn set so the spacecraft went on believing it had a
+        ground station. Guarded by identity the same way client_handler's
+        teardown is, so a stale failure cannot close a newer client's link.
+        """
+        with self.conn_lock:
+            if self.conn is conn:
+                self.conn = None
+                print("[sim] telemetry send failed -- treating ground contact as lost")
 
     def _build_packet(self, sample) -> TelemetryPacket:
         self.seq_num = (self.seq_num + 1) % 65536
@@ -298,7 +319,7 @@ def telemetry_loop(sim: Simulator, stop_event: threading.Event):
             try:
                 conn.sendall(packet.pack())
             except OSError:
-                pass
+                sim.note_link_failure(conn)
         time.sleep(1.0 / sim.telemetry_rate_hz)
 
 

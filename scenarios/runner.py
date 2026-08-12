@@ -122,7 +122,7 @@ class Harness:
             sample.rail_current_a = None
         now = self.env.t
         self.engine.tick(sample, now)
-        self.engine.note_link_state(now, connected=self.env.link_healthy,
+        self.engine.note_link_state(now, link_established=self.env.link_healthy,
                                     seconds_since_contact=sample.seconds_since_ground_contact)
         self.executor.step(self.engine, now)
         return sample, truth

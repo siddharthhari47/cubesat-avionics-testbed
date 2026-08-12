@@ -380,6 +380,15 @@ class SpacecraftEnvironment:
     def step(self, dt: float) -> "tuple[RawSample, GroundTruth]":
         self.t += dt
 
+        # A healthy link means the ground station's periodic heartbeat is
+        # arriving, so contact keeps being re-established (K1). Modelling this
+        # explicitly -- rather than reporting "seconds since contact" as None
+        # whenever the link is up -- is what makes the scenario harness feed
+        # the engine the same KIND of evidence run_simulator.py feeds it, and
+        # therefore what lets a scenario exercise "link open but silent" at all.
+        if self.link_healthy:
+            self.last_ground_contact_t = self.t
+
         # --- time-varying fault effects on state -----------------------------
         if "gradual_drift" in self._fault_start:
             elapsed = self.t - self._fault_start["gradual_drift"]
@@ -459,9 +468,20 @@ class SpacecraftEnvironment:
             node_temp_c={int(n): self.node_temp_c[n] for n in ThermalNode},
             radio_responded=self.device_responsive["radio"],
             mag_responded=self.device_responsive["mag"],
-            seconds_since_ground_contact=(
-                None if self.link_healthy else self.t - self.last_ground_contact_t
-            ),
+            # K1: report elapsed-since-contact ALWAYS, not None-when-healthy.
+            #
+            # This used to collapse to None while the link was up, which meant
+            # the environment was handing the engine a pre-decided verdict
+            # ("healthy") rather than the evidence a real transport produces
+            # (a heartbeat timestamp). The scenario suite therefore exercised a
+            # decision path the deployed transport could not reproduce, and
+            # that is precisely why J1 -- a link that is open but silent --
+            # survived the whole Phase 6 campaign.
+            #
+            # last_ground_contact_t advances while the link is healthy, exactly
+            # as run_simulator.py's last_client_seen advances on each received
+            # ground packet. Same evidence, same units, same meaning.
+            seconds_since_ground_contact=self.t - self.last_ground_contact_t,
         )
         truth = GroundTruth(
             t=self.t,

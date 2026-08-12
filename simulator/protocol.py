@@ -143,6 +143,14 @@ class TelemetryPacket:
         ) = unpacked
         if sync != SYNC_BYTE or packet_id != PACKET_ID_TELEMETRY:
             return None
+        # G4: payload_length was computed on send, read into a throwaway on
+        # receive, and never checked -- a documented ICD field the
+        # implementation treated as decorative. Harmless while every packet is
+        # fixed-size and CRC-protected, but the point of the field is to catch
+        # a sender that disagrees with us about layout, which is exactly the
+        # V1 firmware bring-up failure it would be useful for.
+        if _payload_length != _TM_STRUCT.size - 17:
+            return None
         return cls(
             seq_num=seq_num, timestamp_ms=timestamp_ms, mode=mode,
             fault_flags=fault_flags, health_flags=health_flags, temp_c=temp_c,

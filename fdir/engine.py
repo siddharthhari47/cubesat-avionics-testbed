@@ -579,26 +579,69 @@ class FDIREngine:
     # ten fault flags had no detector inside this engine, yet reset_faults()
     # cleared them: the engine was clearing flags it could not observe.
 
-    def note_link_state(self, now: float, connected: bool,
+    def note_link_state(self, now: float, link_established: bool,
                         seconds_since_contact: Optional[float]) -> None:
         """
-        Report ground-link state. Unlike the latching detectors, COMMS_LOSS is a
-        live indicator: reconnecting IS the recovery, so there is no operator
-        acknowledgement to wait for and it is deliberately absent from
-        RESETTABLE_FLAGS.
+        Report ground-link EVIDENCE. The engine decides what it means.
+
+        Unlike the latching detectors, COMMS_LOSS is a live indicator:
+        reconnecting IS the recovery, so there is no operator acknowledgement to
+        wait for and it is deliberately absent from RESETTABLE_FLAGS.
+
+        J1/K1 -- WHY THIS TAKES EVIDENCE RATHER THAN A VERDICT.
+        This used to accept `connected: bool` and short-circuit on it: if
+        connected, COMMS_LOSS was cleared unconditionally and
+        seconds_since_contact was never examined at all. The transport supplied
+        that boolean as `self.conn is not None` -- a socket OBJECT EXISTING, not
+        evidence that anything is on the other end. On a half-open TCP link
+        (cable pulled, ground station killed, NAT idle timeout) recv blocks
+        forever, the socket is never closed, and the spacecraft went on
+        believing it had ground contact indefinitely. Measured: connected=True
+        with seconds_since_contact=10000 against a 5 s timeout latched nothing.
+
+        That mattered because COMMS_LOSS is the ONLY flag carrying authority to
+        open the comms recovery ladder. R5 exists precisely because the ground
+        cannot fix the radio it would have to talk through -- and the silent
+        link failure, the case that ladder was built for, was the one case the
+        spacecraft could not detect.
+
+        The second half of the defect was that the scenario harness supplied a
+        clean `link_healthy` boolean from the physics model, so the suite
+        validated a decision path the real transport could not produce. Taking
+        raw evidence puts the decision in ONE place that both callers reach,
+        which is the only structural fix -- correcting the transport alone would
+        have left the harness free to disagree with it again.
+
+        THE DECIDING EVIDENCE IS THE HEARTBEAT, AND ONLY THE HEARTBEAT.
+        `link_established` is recorded for diagnosis but deliberately does not
+        gate the decision, because it is unreliable in BOTH directions:
+
+          * established=True proves nothing. A half-open socket stays "up"
+            indefinitely with nothing behind it -- that is J1.
+          * established=False does not yet prove loss either. A TCP reconnect
+            or a radio handover briefly drops the transport while contact is
+            perfectly healthy, and latching on that would trade J1 for a
+            false positive. COMMS_LOSS_TIMEOUT_S is the grace period.
+
+        So: contact is lost exactly when nothing has been heard for longer than
+        the timeout. That single rule covers both.
         """
         if self.mode == Mode.BOOT:
             # "No ground station has connected yet" is normal during boot, not a
             # fault. Same class of cold-start false positive as the adaptive
             # baseline and lockup warm-ups.
             return
-        if connected:
+        stale = (seconds_since_contact is None
+                 or seconds_since_contact >= cfg.COMMS_LOSS_TIMEOUT_S)
+        if not stale:
             if self.fault_flags & FaultFlag.COMMS_LOSS:
                 self._emit(now, "COMMS_LOSS cleared (ground contact restored)")
             self.fault_flags &= ~FaultFlag.COMMS_LOSS
-        elif seconds_since_contact is None or seconds_since_contact >= cfg.COMMS_LOSS_TIMEOUT_S:
+        else:
             if not self.fault_flags & FaultFlag.COMMS_LOSS:
-                self._emit(now, f"COMMS_LOSS latched (no ground contact for >= {cfg.COMMS_LOSS_TIMEOUT_S} s)")
+                why = ("no transport link" if not link_established
+                       else f"link open but nothing heard for >= {cfg.COMMS_LOSS_TIMEOUT_S} s")
+                self._emit(now, f"COMMS_LOSS latched ({why})")
             self.fault_flags |= FaultFlag.COMMS_LOSS
 
     # ---- recovery proposals -------------------------------------------------

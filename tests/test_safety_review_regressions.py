@@ -380,3 +380,148 @@ def test_corrupt_state_cannot_crash_the_boot():
         engine = FDIREngine()
         engine.import_recovery_state(junk, now=0.0)
         assert engine.campaign is None
+
+
+# ---------------------------------------------------------------------------
+# Round 2 -- the dimensions the first pass skipped
+# ---------------------------------------------------------------------------
+
+# J1 -- a link that is open but silent
+
+def test_an_open_but_silent_link_is_comms_loss():
+    """
+    J1, the round-2 headline. `connected` used to short-circuit the decision,
+    and the transport supplied it as `self.conn is not None` -- a socket OBJECT
+    existing. On a half-open link recv blocks forever, so the spacecraft went
+    on believing it had ground contact indefinitely, and COMMS_LOSS -- the only
+    flag that can open the comms recovery ladder -- could not latch during the
+    exact failure that ladder exists for.
+    """
+    e, t = nominal_engine()
+    for _ in range(50):
+        e.tick(sample(), t)
+        e.note_link_state(t, link_established=True, seconds_since_contact=10_000.0)
+        t += 0.1
+    assert e.fault_flags & FaultFlag.COMMS_LOSS, (
+        "a socket that exists is not evidence anyone is on the other end"
+    )
+
+
+def test_a_brief_transport_dropout_is_not_comms_loss():
+    """
+    The other direction, which is why the heartbeat and not `link_established`
+    is the deciding evidence. A TCP reconnect or radio handover drops the
+    transport while contact is fine; latching on that would trade J1 for a
+    false positive.
+    """
+    e, t = nominal_engine()
+    e.note_link_state(t, link_established=False,
+                      seconds_since_contact=cfg.COMMS_LOSS_TIMEOUT_S - 0.1)
+    assert not (e.fault_flags & FaultFlag.COMMS_LOSS)
+
+
+def test_contact_evidence_decides_in_both_directions():
+    e, t = nominal_engine()
+    e.note_link_state(t, link_established=False, seconds_since_contact=None)
+    assert e.fault_flags & FaultFlag.COMMS_LOSS, "never heard from = no contact"
+    e.note_link_state(t, link_established=False, seconds_since_contact=0.0)
+    assert not (e.fault_flags & FaultFlag.COMMS_LOSS), (
+        "just heard from the ground -- the socket's state does not override that"
+    )
+
+
+# K1 -- the harness must feed the engine the same KIND of evidence
+
+def test_environment_reports_contact_age_not_a_verdict():
+    """
+    K1. The environment used to report seconds_since_ground_contact as None
+    whenever the link was healthy -- a pre-decided verdict, not the heartbeat
+    a real transport produces. That is why the scenario suite could not express
+    "link open but silent" at all, and why J1 survived Phase 6.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "simulator"))
+    from environment import SpacecraftEnvironment
+
+    env = SpacecraftEnvironment(seed=5)
+    s1, _ = env.step(0.1)
+    assert s1.seconds_since_ground_contact is not None, (
+        "a healthy link must still report HOW LONG since contact"
+    )
+    assert s1.seconds_since_ground_contact == pytest.approx(0.0, abs=1e-9)
+
+    env.link_healthy = False
+    for _ in range(100):
+        s2, _ = env.step(0.1)
+    assert s2.seconds_since_ground_contact > cfg.COMMS_LOSS_TIMEOUT_S
+
+
+def test_the_comms_timeout_is_actually_exercised():
+    """
+    Found while fixing K1: because last_ground_contact_t was never advanced,
+    seconds_since_ground_contact was really "seconds since boot" and was
+    already past the timeout before any fault was injected. COMMS_LOSS latched
+    instantly on every link drop and COMMS_LOSS_TIMEOUT_S was never exercised
+    by any test. This pins that the debounce genuinely runs.
+    """
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "simulator"))
+    from environment import SpacecraftEnvironment
+
+    env = SpacecraftEnvironment(seed=6)
+    e = FDIREngine()
+    for _ in range(40):                        # boot with a healthy link
+        s, _t = env.step(0.1)
+        e.tick(s, env.t)
+        e.note_link_state(env.t, link_established=env.link_healthy,
+                          seconds_since_contact=s.seconds_since_ground_contact)
+    assert not (e.fault_flags & FaultFlag.COMMS_LOSS)
+
+    env.link_healthy = False
+    latched_at = None
+    drop_t = env.t
+    for _ in range(200):
+        s, _t = env.step(0.1)
+        e.tick(s, env.t)
+        e.note_link_state(env.t, link_established=env.link_healthy,
+                          seconds_since_contact=s.seconds_since_ground_contact)
+        if e.fault_flags & FaultFlag.COMMS_LOSS and latched_at is None:
+            latched_at = env.t
+    assert latched_at is not None
+    assert latched_at - drop_t == pytest.approx(cfg.COMMS_LOSS_TIMEOUT_S, abs=0.2), (
+        f"latched {latched_at - drop_t:.2f}s after the drop; the configured "
+        f"debounce is {cfg.COMMS_LOSS_TIMEOUT_S}s"
+    )
+
+
+# G1/G2 -- enum conversion on unvalidated wire data
+
+def test_an_unknown_ack_status_is_rendered_not_raised():
+    """G1: this raised ValueError and killed the reader thread outright."""
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "ground-station"))
+    from link import _status_name
+    from simulator.protocol import AckStatus
+
+    assert _status_name(int(AckStatus.ACCEPTED)) == "ACCEPTED"
+    assert _status_name(0x08) == "UNKNOWN_STATUS(0x08)"
+    assert _status_name(0xFF) == "UNKNOWN_STATUS(0xFF)"
+
+
+def test_an_out_of_range_mode_does_not_crash_the_timeline():
+    """G2: Mode(99) raised ValueError and took the whole timeline with it."""
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "ground-station"))
+    from timeline import build_timeline
+    from simulator.protocol import TelemetryPacket
+
+    def pkt(mode):
+        return TelemetryPacket(
+            seq_num=0, timestamp_ms=0, mode=mode, fault_flags=0, health_flags=15,
+            temp_c=25.0, accel_x=0.0, accel_y=0.0, accel_z=9.8, gyro_x=0.0,
+            gyro_y=0.0, gyro_z=0.0, mag_x=0.0, mag_y=0.0, mag_z=0.0,
+            bus_voltage_v=5.0, bus_current_a=0.4, uptime_s=0, cmd_rx_count=0,
+            cmd_accept_count=0, cmd_reject_count=0, corrupted_rx_count=0)
+
+    events = build_timeline([pkt(99)])
+    assert events and "99" in events[0].label

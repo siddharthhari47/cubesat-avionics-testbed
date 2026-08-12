@@ -47,7 +47,7 @@ class Harness:
         now = self.env.t
         self.engine.tick(sample, now, ml_advisory=ml_advisory)
         self.engine.note_link_state(
-            now, connected=self.env.link_healthy,
+            now, link_established=self.env.link_healthy,
             seconds_since_contact=sample.seconds_since_ground_contact,
         )
         self.executor.step(self.engine, now)
@@ -87,8 +87,18 @@ def test_csswe_radio_latchup_recovers_autonomously():
     assert truth.rail_latched[int(Rail.RADIO)] is True
     assert sample.radio_responded is False
 
-    # Long enough for the recovery trigger, plus dwell and settle.
-    ticks = int(cfg.COMMS_RECOVERY_TRIGGER_S / DT) + 60
+    # Long enough for the COMMS_LOSS debounce, THEN the recovery trigger, plus
+    # dwell and settle.
+    #
+    # The debounce term is new and it is not padding. Before K1, the
+    # environment never advanced last_ground_contact_t, so
+    # seconds_since_ground_contact was really "seconds since boot" -- already
+    # past the 5 s timeout by the time any fault was injected. COMMS_LOSS
+    # therefore latched the instant the link dropped and
+    # COMMS_LOSS_TIMEOUT_S was never actually exercised by this test or any
+    # other. Now that the timeout genuinely applies, the ladder starts 5 s
+    # later and the old budget expired mid-campaign.
+    ticks = int((cfg.COMMS_LOSS_TIMEOUT_S + cfg.COMMS_RECOVERY_TRIGGER_S) / DT) + 120
     sample, truth = h.run(ticks)
 
     assert h.executor.attempts_for(RecoveryAction.POWER_CYCLE, int(Rail.RADIO)) == 1, (
