@@ -8,6 +8,12 @@ states plainly what this review is and is not.
 > `tests/test_safety_review_regressions.py` (32 tests). Suite: 249 → **281 passing**.
 > Fixing F2 exposed a seventh problem — a test that had been passing for the wrong
 > reason. See §6 for what changed and what it cost.
+>
+> **ROUND 2 (§7) has since run the five dimensions §5 skipped.** Four more findings,
+> including one HIGH that defeats R5 outright: the spacecraft cannot notice a silent
+> link failure, so the entire CSSWE recovery ladder is gated behind a flag that never
+> latches. Two of my own earlier concerns were **refuted by measurement** and are
+> recorded as such. Round 2 findings are reported, not yet fixed.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -384,3 +390,198 @@ its negative assertions are still clean, so none of these fixes moved a measured
 **Still not reviewed:** protocol parsing, threading, ML internals, scenario-suite
 correctness, and unbounded growth of `FDIREngine.log`. Unchanged from §5 — fixing six
 findings in the areas that *were* examined says nothing about the areas that were not.
+
+*(Round 2 below closes exactly this list.)*
+
+---
+
+## 7. Round 2 — the dimensions §5 skipped
+
+Same method: probes that execute, not code that is read. Four new findings, one of them
+the most consequential of either round, plus two of my own earlier concerns **refuted by
+measurement** — recorded because a review that only ever confirms its own suspicions is
+not a review.
+
+| # | Severity | Defect | Reachable in V0 |
+|---|---|---|---|
+| G1 | **HIGH** | One undefined `AckStatus` byte permanently kills the ground station's reader thread — while it still reports `connected` | Yes |
+| J1 | **HIGH** | `connected` overrides the contact heartbeat entirely, and means "a socket object exists" | Yes |
+| K1 | MEDIUM | The scenario suite drives comms loss through a signal the real transport cannot produce | Yes |
+| G2 | MEDIUM | An out-of-range `mode` crashes the timeline and the dashboard | Yes |
+| G3 | MEDIUM | The packet-corruption signal is computed and then discarded ground-side | Yes |
+| G4 | LOW | `payload_length` is written on send and never checked on receive | Yes |
+
+---
+
+### J1 — The spacecraft can believe it has ground contact indefinitely after losing it
+
+**Severity: HIGH.** Defeats R5, and with it the entire CSSWE recovery ladder.
+
+Two pieces combine.
+
+**First**, `note_link_state()` consults the heartbeat only in its `elif`:
+
+```python
+if connected:
+    self.fault_flags &= ~FaultFlag.COMMS_LOSS      # unconditional
+elif seconds_since_contact is None or seconds_since_contact >= cfg.COMMS_LOSS_TIMEOUT_S:
+    self.fault_flags |= FaultFlag.COMMS_LOSS
+```
+
+`connected` wins outright. `seconds_since_contact` is never examined when it is True.
+
+**Second**, the transport defines `connected = self.conn is not None`
+([`simulator/run_simulator.py:148`](../../simulator/run_simulator.py)) — the existence of
+a socket object, not evidence that anything is on the other end. `sim.conn` is cleared
+only in `client_handler`'s `finally`, which requires `read_packet()` to return or raise.
+On a half-open TCP connection — cable pulled, ground-station machine dies, NAT idle
+timeout — `recv` blocks indefinitely and never does either.
+
+And the one signal that *would* prove contact is gone is thrown away:
+
+```python
+try:
+    conn.sendall(packet.pack())
+except OSError:
+    pass
+```
+
+A failed send is the strongest available evidence that the link is dead. It is swallowed,
+`sim.conn` is not cleared, and `last_client_seen` is not consulted.
+
+**Reproduced:**
+
+```
+connected=True, seconds_since_contact=10000  (COMMS_LOSS_TIMEOUT_S = 5.0)
+  COMMS_LOSS latched : False
+  campaign opened    : False
+
+control -- same elapsed time, connected=False
+  COMMS_LOSS latched : True
+  campaign opened    : True
+```
+
+So `COMMS_LOSS` — the only flag that authorises the comms recovery ladder — cannot latch
+during the exact failure the ladder was built for. R5 exists because *the ground cannot
+fix the radio it would have to talk through*; this is a link failure the spacecraft
+cannot notice.
+
+**Fix.** Make `connected` mean *contact observed recently*, not *socket exists*: pass the
+heartbeat and let the engine apply the timeout in both branches, and treat a failed
+`sendall` as contact lost. ~2 h including a test that drives a half-open link.
+
+---
+
+### K1 — The scenario suite validates a path the real transport cannot reach
+
+**Severity: MEDIUM**, and it is why J1 survived Phase 6.
+
+| | How `connected` is produced |
+|---|---|
+| `scenarios/runner.py:125` | `connected=self.env.link_healthy` — a clean boolean straight from the physics model |
+| `simulator/run_simulator.py:148` | `connected = self.conn is not None` — socket-object existence |
+
+The harness hands the engine exactly the signal that makes the logic work. The deployed
+transport computes something different, which a silent failure never sets to False. The
+`communication_loss` scenario passes, and R5 is recorded as MET in the traceability doc,
+on the strength of a path the real system does not take.
+
+This is the **simulator-and-engine shared-assumption** category named in §5 as the
+biggest blind spot — the one the planned `test-integrity` dimension existed to find.
+It is now found twice: once here, once when fixing F2 exposed a self-fulfilling R4
+assertion. Two instances is not a rate, but it is no longer a hypothetical.
+
+---
+
+### G1 — One undefined status byte permanently kills the ground station
+
+**Severity: HIGH.**
+
+`link.py:95` converts a wire value straight into an enum:
+
+```python
+"status": proto.AckStatus(packet.status).name,
+```
+
+An undefined status raises `ValueError`. `_run()` catches only `OSError`, so the
+exception escapes the thread entirely — despite the comment three lines above stating
+*"A dropped link must not silently kill this background thread — that's exactly the kind
+of failure a ground station has to survive."*
+
+**Reproduced.** One ack with status `0x08`, then five perfectly good telemetry packets:
+
+```
+reader thread alive    : False
+telemetry received     : 0   (5 were sent)
+link reports connected : True
+```
+
+The dashboard shows a healthy connection and never updates again. Silent, permanent, in
+the operator's only window into the spacecraft. This is squarely a V1 failure mode:
+firmware under development emits a status code the ground station does not know yet, and
+the ground station dies rather than displaying "unknown status 0x08".
+
+**Fix.** Never construct an enum from wire data without a fallback, and catch `Exception`
+around the read loop so one bad packet costs a reconnect rather than the thread. ~1 h.
+
+---
+
+### G2, G3, G4 — smaller, same root
+
+- **G2 (MEDIUM):** `Mode(pkt.mode)` in both `timeline.build_timeline()` and the
+  dashboard. Verified: a CRC-valid packet with `mode=99` unpacks fine, then raises
+  `ValueError: 99 is not a valid Mode`. Same fix as G1.
+- **G3 (MEDIUM):** `read_packet()` returns `(packet, was_corrupted)` and `link.py:80`
+  binds the second to `_corrupted` and drops it. `GroundLink` has no corruption counter
+  at all. CLAUDE.md names **"packet loss vs. range"** as one of the five numbers this
+  project must produce — the one place that could measure it discards the evidence.
+- **G4 (LOW):** `payload_length` is computed on send and read into `_payload_length` on
+  receive, then never checked. Harmless while packets are fixed-size and CRC-protected,
+  but it is a documented ICD field that the implementation treats as decorative, and
+  firmware emitting a wrong value would go unnoticed.
+
+---
+
+### Refuted by measurement
+
+**`FDIREngine.log` does not grow unboundedly in any practical sense.** §5 flagged this
+in passing; measurement does not support the concern. The log appends only on state
+*changes*:
+
+```
+20,000 nominal ticks (~33 min at 10 Hz)  ->  1 log entry
+4,000 ticks of a FLAPPING fault          ->  43 entries (0.011/tick)
+extrapolated to 24 h at 10 Hz            ->  ~9,300 entries, ~1 MB
+```
+
+Worth bounding before it runs on an STM32 with tens of KB of RAM, but it is a V1 sizing
+question, not the runaway I implied. Downgraded to LOW.
+
+**`FDIREngine.tick()` really is a pure function of state.** Two engines fed identical
+input produced identical flags, mode, and logs. No mutable default arguments anywhere in
+the class, and the engine never imports `time` — `now` is always passed in. The one
+caveat is encapsulation rather than purity: `engine.log` and `engine.pending_intents`
+are public mutable lists, and a caller can append to them directly. Nothing does. LOW.
+
+---
+
+### Also clean
+
+- **Lock ordering.** The only nesting is `self.lock → self.conn_lock` (in `tick()` →
+  `_update_comms_loss`). All four other `conn_lock` acquisitions are sequential, not
+  nested inside `self.lock`. No inversion exists, so no deadlock path does either.
+- **`xfail` markers: none exist** anywhere in the suite, so there is nothing silently
+  passing under one and no XPASS to audit.
+- **Mocks: one file** (`test_recovery_seam.py`). Every other test drives real objects
+  against the real engine.
+- **ML `_sample_std`** returns 0.0 for n < 2 rather than dividing by `n-1 = 0`, matching
+  `features.py`'s `fillna(0.0)`. No division-by-zero path.
+
+---
+
+### Standing after both rounds
+
+Ten findings, six fixed, four open (G1, J1, K1 and the G2–G4 group). Every dimension
+originally planned has now been run. What has *not* been done is an independent
+adversarial pass over these conclusions — both rounds were a single reviewer who wrote
+most of the code, and that limitation from §5 is unchanged.
