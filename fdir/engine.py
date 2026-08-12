@@ -28,6 +28,7 @@ line of code two paragraphs down, not a policy note someone could forget to
 enforce elsewhere.
 """
 
+import math
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -60,14 +61,44 @@ SAFE_MODE_TRIGGER_FLAGS = (
 
 # Flags backed by an ongoing physical condition. RESET_FAULTS may clear these
 # only on positive evidence that the condition has gone away (see reset_faults).
+#
+# DATA_PATH_SUSPECT, UNKNOWN_ANOMALY and SENSOR_INVALID were added after the V0
+# adversarial safety review (F1, F5). All three were in NEITHER this set nor
+# EVENT_FLAGS, which meant reset_faults() never even considered them and nothing
+# else cleared them either -- not start_boot(), not watchdog_reset(). They
+# latched once and stayed set for the life of the vehicle.
+#
+# DATA_PATH_SUSPECT was the severe one. diagnose() checks it FIRST by design,
+# because a suspect shared path explains away the per-device symptoms under it.
+# Stuck permanently, that made every subsequent diagnosis DATA_PATH at
+# Confidence.LIKELY -- with authorises_action True -- on a completely healthy
+# vehicle, masking real faults underneath. A permanently confident wrong
+# diagnosis is the exact Delfi-C3 failure mode fdir/diagnosis.py exists to
+# prevent; it was being reintroduced through a latch that could not clear.
+#
+# The evidence machinery was already correct in every case: _observe() had been
+# faithfully counting clean ticks that nothing ever read. This is the one-line
+# consequence of wiring it up.
 CONDITION_BACKED_FLAGS = (
     FaultFlag.SENSOR_TIMEOUT | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
     | FaultFlag.SENSOR_LOCKUP | FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
+    | FaultFlag.DATA_PATH_SUSPECT | FaultFlag.UNKNOWN_ANOMALY | FaultFlag.SENSOR_INVALID
 )
 
 # Flags recording that something happened, not that something is wrong.
 # Acknowledging them always clears them.
-EVENT_FLAGS = FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET
+#
+# RECOVERY_FAILED belongs here rather than above (F5): it records a completed
+# episode -- "autonomy tried everything and stood down" -- not a live condition
+# that could be re-observed as clear. Left unclearable it survived a LATER
+# successful campaign, so a vehicle whose autonomy subsequently worked still
+# displayed permanent failure. Clearing it does not restart autonomy: the
+# stand-down decision is held in the campaign state machine
+# (_update_recovery_proposals reads campaign.finished, never this flag), so
+# acknowledging the indication cannot re-arm a ladder that already exhausted.
+EVENT_FLAGS = (
+    FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET | FaultFlag.RECOVERY_FAILED
+)
 
 RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
 
@@ -116,8 +147,19 @@ class EwmaStat:
         self.alpha = alpha
         self.mean: Optional[float] = None
         self.var = 0.0
+        # Counted, not silently swallowed. A detector that has stopped being fed
+        # valid data must be distinguishable from one reporting "all clear".
+        self.rejected = 0
 
     def update(self, x: float) -> None:
+        # F4: one NaN used to poison mean and var IRREVERSIBLY -- every
+        # subsequent arithmetic result is NaN, deviation_sigma() returns NaN,
+        # and `NaN > ADAPTIVE_K` is False forever, so the detector silently
+        # never fired again while looking exactly like a healthy one. Measured:
+        # 500 clean samples after a single NaN did not recover it.
+        if not math.isfinite(x):
+            self.rejected += 1
+            return
         if self.mean is None:
             self.mean = x
             return
@@ -126,7 +168,7 @@ class EwmaStat:
         self.var = (1 - self.alpha) * (self.var + self.alpha * delta * delta)
 
     def deviation_sigma(self, x: float) -> float:
-        if self.mean is None or self.var <= 0:
+        if self.mean is None or self.var <= 0 or not math.isfinite(x):
             return 0.0
         return abs(x - self.mean) / (self.var ** 0.5)
 
@@ -149,6 +191,7 @@ class FDIREngine:
 
         self._imu_history: deque = deque(maxlen=cfg.LOCKUP_WINDOW_SAMPLES)
         self._suspect_now: set = set()
+        self._invalid_now: set = set()
         self._ml_breach_count = 0
 
         # Consecutive non-breaching observations per fault flag. This is the
@@ -215,6 +258,12 @@ class FDIREngine:
                 self.mode = Mode.NOMINAL
                 self._emit(now, "BOOT -> NOMINAL: self-check clean")
 
+        # Validity runs FIRST, ahead of even the data-path discriminator: a
+        # channel returning NaN has not produced a reading at all, so nothing
+        # downstream should be allowed to draw a conclusion from it -- in
+        # either direction. See _update_sample_validity.
+        self._update_sample_validity(sample, now)
+
         # Order matters: the data-path discriminator must run BEFORE the
         # per-channel detectors it gates, or they will have already latched on
         # a reading the path made up.
@@ -252,6 +301,34 @@ class FDIREngine:
     # reasoning: false positives are handled by not tripping in the first place
     # (debounce), not by being quick to forgive after the fact.
 
+    def _update_sample_validity(self, sample: RawSample, now: float) -> None:
+        """
+        Is anything in this sample not a representable number? (V0 review F3.)
+
+        Named explicitly rather than folded into the individual detectors
+        because a broken channel is its own condition with its own operator
+        meaning. The alternative -- letting each detector decide what NaN means
+        to it -- is what produced two detectors disagreeing about the same
+        reading, one failing open and one failing closed.
+
+        Latches like every other detector, but without a debounce window: a
+        single non-finite reading is already conclusive. There is no such thing
+        as a transient NaN that might have been a real measurement.
+        """
+        invalid = sample.invalid_devices()
+        breaching = bool(invalid) or not sample.power_valid
+        self._invalid_now = invalid
+        self._observe(FaultFlag.SENSOR_INVALID, breaching)
+        if not breaching:
+            return
+        if not self.fault_flags & FaultFlag.SENSOR_INVALID:
+            channels = ", ".join(sorted(d.name for d in invalid)) or "-"
+            self._emit(now, f"SENSOR_INVALID latched (non-finite readings: "
+                            f"devices [{channels}]"
+                            f"{', power' if not sample.power_valid else ''}) "
+                            f"-- these channels are carrying no information")
+        self.fault_flags |= FaultFlag.SENSOR_INVALID
+
     def _update_sensor_timeout(self, sample: RawSample, now: float) -> None:
         self._observe(FaultFlag.SENSOR_TIMEOUT, not sample.imu_responded)
         if not sample.imu_responded:
@@ -267,6 +344,25 @@ class FDIREngine:
             self._sensor_timeout_since = None
 
     def _update_undervoltage(self, sample: RawSample, now: float) -> None:
+        # F3, the most dangerous finding of the V0 safety review. Every
+        # comparison with NaN is False, so `NaN < UNDERVOLTAGE_CRITICAL_V` took
+        # the else branch below and called _observe(..., False) -- recording a
+        # meaningless reading as POSITIVE EVIDENCE that a latched undervoltage
+        # had cleared. Measured end to end: latched UNDERVOLTAGE_CRITICAL, then
+        # 60 NaN ticks, then RESET_FAULTS cleared it and exit_safe_mode() was
+        # accepted. A vehicle correctly held in SAFE was returned to service on
+        # readings that carried no information.
+        #
+        # That defeated the entire point of the D2 fix, which was to require
+        # positive evidence rather than absence of evidence.
+        #
+        # Record NO evidence in either direction, and deliberately do NOT reset
+        # the debounce timer: a garbage reading is not grounds to forgive an
+        # undervoltage that was already accumulating.
+        if not sample.power_valid:
+            self.health_flags &= ~HealthFlag.POWER_OK
+            return
+        self.health_flags |= HealthFlag.POWER_OK
         self._observe(FaultFlag.UNDERVOLTAGE_CRITICAL,
                       sample.bus_voltage_v < cfg.UNDERVOLTAGE_CRITICAL_V)
         if sample.bus_voltage_v < cfg.UNDERVOLTAGE_CRITICAL_V:
@@ -284,10 +380,26 @@ class FDIREngine:
             self.fault_flags &= ~FaultFlag.UNDERVOLTAGE_WARNING
 
     def _update_thermal(self, sample: RawSample, now: float) -> None:
+        # A non-finite temperature used to latch THERMAL_ANOMALY -- safely, but
+        # by accident: `not (LOW <= NaN <= HIGH)` is `not False`, so this
+        # predicate happened to fail closed while _update_undervoltage's
+        # happened to fail open. Same language rule, opposite outcomes, decided
+        # by nothing more than how each expression was phrased.
+        #
+        # Latching here would also be a WRONG diagnosis: the truth is "the
+        # temperature sensor is broken", not "the spacecraft is too hot", and
+        # THERMAL_ANOMALY carries SAFE authority and could authorise a
+        # thermal-specific response to a fault that is not thermal. Naming the
+        # real condition (SENSOR_INVALID) is the R10-consistent answer.
+        if Device.TEMP in sample.invalid_devices():
+            self._thermal_since = None
+            self.health_flags &= ~HealthFlag.TEMP_OK
+            return
         if not self._channel_trusted(Device.TEMP):
             self._thermal_since = None
             self._observe(FaultFlag.THERMAL_ANOMALY, False)
             return
+        self.health_flags |= HealthFlag.TEMP_OK
         out_of_band = not (cfg.THERMAL_CRITICAL_LOW_C <= sample.temp_c <= cfg.THERMAL_CRITICAL_HIGH_C)
         self._observe(FaultFlag.THERMAL_ANOMALY, out_of_band)
         if out_of_band:
@@ -378,6 +490,14 @@ class FDIREngine:
         # what caused the adaptive-baseline cold-start bug found in V0).
         if self.mode == Mode.BOOT:
             self._imu_history.clear()
+            return
+        if Device.IMU in getattr(self, "_invalid_now", set()):
+            # NaN comparisons make "is this window all identical?" meaningless
+            # (NaN != NaN, but a repeated NaN *object* compares equal inside a
+            # tuple, so the answer would depend on object identity). Refuse to
+            # answer rather than answer by accident.
+            self._imu_history.clear()
+            self.health_flags &= ~HealthFlag.IMU_OK
             return
         if not self._channel_trusted(Device.IMU):
             # The path carrying this reading is under suspicion, so the reading
@@ -653,8 +773,11 @@ class FDIREngine:
             self._comms_loss_since = now
             return
         if now - self._comms_loss_since >= cfg.COMMS_RECOVERY_TRIGGER_S:
+            # No arguments: the ladder now names the radio DEVICE and the radio
+            # RAIL separately and defaults both correctly. Passing one id for
+            # both was the F2 defect.
             self._start_campaign(
-                now, FaultFlag.COMMS_LOSS, comms_loss_ladder(int(Rail.RADIO)),
+                now, FaultFlag.COMMS_LOSS, comms_loss_ladder(),
                 f"no ground contact for >= {cfg.COMMS_RECOVERY_TRIGGER_S} s",
             )
 
@@ -678,7 +801,12 @@ class FDIREngine:
             return
         try:
             campaign = Campaign.from_dict(state)
-        except (KeyError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError) as exc:
+            # TypeError added with F6's range checks: comparing a string
+            # attempt-count against 0 raises TypeError, not ValueError, and an
+            # uncaught exception here would crash the flight software on boot
+            # over a corrupted NVM record -- turning a recoverable data fault
+            # into a boot loop.
             self._emit(now, f"recovery state discarded (unreadable: {exc})")
             return
         if campaign.finished:

@@ -29,9 +29,10 @@ Wire encoding (struct formats, packing, CRC) deliberately stays in
 simulator/protocol.py — that is transport, not vocabulary.
 """
 
+import math
 from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 
 __all__ = ["Mode", "FaultFlag", "HealthFlag", "RawSample", "Rail", "ThermalNode",
            "Device", "Bus", "BUS_MEMBERS"]
@@ -146,6 +147,22 @@ class FaultFlag(IntFlag):
     # is required to be able to say "I do not know" rather than invent a
     # cause: 63% of the failure record has no identifiable cause at all.
     UNKNOWN_ANOMALY = 1 << 12
+    # A sensor channel returned a value that is not physically representable
+    # (NaN or infinity) -- the reading carries no information at all.
+    #
+    # This exists because of a defect found in the V0 adversarial safety review
+    # (F3): every comparison with NaN is False in both Python and C, so a NaN
+    # bus voltage silently passed `v < UNDERVOLTAGE_CRITICAL_V` and was recorded
+    # as POSITIVE EVIDENCE that a latched undervoltage had cleared. A vehicle
+    # correctly held in SAFE could be returned to service on readings that meant
+    # nothing. Making "this channel is lying" a first-class observable is the
+    # fix; silently trusting it was the bug.
+    #
+    # Carries NEITHER SAFE-mode nor recovery authority: an invalid reading says
+    # the sensor is untrustworthy, not that the spacecraft is in danger, and
+    # inventing a specific fault from a broken channel is the wrong-diagnosis
+    # failure this project exists to avoid (R10).
+    SENSOR_INVALID = 1 << 13
 
 
 class HealthFlag(IntFlag):
@@ -205,3 +222,47 @@ class RawSample:
     radio_responded: bool = True
     mag_responded: bool = True
     seconds_since_ground_contact: Optional[float] = None
+
+    # --- validity (V0 safety review, F3/F4) ----------------------------------
+    # Deliberately reported rather than raised. Flight software does not get to
+    # crash on a bad sensor read; it has to keep flying and say so. Construction
+    # therefore never fails, and every detector asks these questions itself.
+
+    def invalid_devices(self) -> Set["Device"]:
+        """
+        Devices whose readings this cycle are not physically representable.
+        NaN and +/-inf both qualify: neither carries information, and both
+        silently satisfy or defeat every threshold comparison written about
+        them, depending only on which way the predicate happens to be phrased.
+        """
+        bad: Set[Device] = set()
+        if not _all_finite(self.accel_x, self.accel_y, self.accel_z,
+                           self.gyro_x, self.gyro_y, self.gyro_z):
+            bad.add(Device.IMU)
+        if not _all_finite(self.mag_x, self.mag_y, self.mag_z):
+            bad.add(Device.MAG)
+        if not _all_finite(self.temp_c):
+            bad.add(Device.TEMP)
+        return bad
+
+    @property
+    def power_valid(self) -> bool:
+        """Are the power observables usable? Voltage drives SAFE-mode authority,
+        so this is the one whose absence must never read as 'nominal'."""
+        return _all_finite(self.bus_voltage_v, self.bus_current_a)
+
+
+def _all_finite(*values) -> bool:
+    """
+    True only if every value is a real, finite number.
+
+    Booleans are rejected on purpose: `isinstance(True, int)` is True in Python,
+    and a bool arriving where a voltage belongs is a wiring mistake worth
+    catching rather than silently coercing to 1.0.
+    """
+    for v in values:
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return False
+        if not math.isfinite(v):
+            return False
+    return True

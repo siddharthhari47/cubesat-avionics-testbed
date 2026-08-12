@@ -76,7 +76,22 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 10 | Recovery campaign exhausted every rung without verification | R3 |
 | 11 | Data-path suspect: 2+ devices on one bus invalid together | R6 |
 | 12 | Unknown anomaly: no enumerated diagnosis matches | R10 |
-| 13-31 | Reserved | — |
+| 13 | Sensor invalid: a channel returned a non-finite value (NaN/inf) | F3 |
+| 14-31 | Reserved | — |
+
+**On bit 13.** Added after the V0 adversarial safety review. Every comparison
+with NaN is False in both Python and C, so a NaN reading silently satisfied or
+defeated every threshold written about it depending only on how the predicate
+happened to be phrased — one detector failed open, another failed closed, on the
+same reading. Worse, a NaN bus voltage was recorded as *positive evidence* that a
+latched undervoltage had cleared, which could return a vehicle correctly held in
+SAFE to service. Making "this channel is carrying no information" a first-class
+observable is the fix.
+
+It carries **neither SAFE-mode nor recovery authority**: an invalid reading means
+the sensor is untrustworthy, not that the spacecraft is in danger, and inventing a
+specific fault out of a broken channel is the wrong-diagnosis failure R10 exists
+to prevent. Clearable via `RESET_FAULTS` on the usual positive evidence.
 
 ## Health Flag Bits (offset 13, uint16 bitmask)
 

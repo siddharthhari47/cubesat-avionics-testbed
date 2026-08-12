@@ -3,6 +3,12 @@
 **Date:** 2026-08-12 · **Scope:** Phases 0–8, `fdir/` core · **Method:** see §5, which
 states plainly what this review is and is not.
 
+> **STATUS: all six fixed, same day.** Each fix was verified by re-running the exact
+> probe that found the defect, and each is pinned by a regression test in
+> `tests/test_safety_review_regressions.py` (32 tests). Suite: 249 → **281 passing**.
+> Fixing F2 exposed a seventh problem — a test that had been passing for the wrong
+> reason. See §6 for what changed and what it cost.
+
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
 simulator and would produce wrong behaviour on hardware, which is the category most
@@ -305,3 +311,76 @@ scenario suite's own correctness, and long-run resource growth (`self.log` in
 investigated).
 
 Absence of findings in those areas is absence of review, not evidence of correctness.
+
+---
+
+## 6. Resolution
+
+All six fixed. Every fix verified by re-running the probe that found the defect, not by
+the fix "looking right".
+
+| # | Fix | Verified by |
+|---|---|---|
+| F1 | `DATA_PATH_SUSPECT` added to `CONDITION_BACKED_FLAGS` — the `_observe()` evidence counter was already correct and simply wired to nothing | flag clears after recovery; healthy vehicle now diagnoses `UNKNOWN`; a real undervoltage is no longer masked |
+| F2 | `Rung.target` now carries its **enum type**, not a bare int; `comms_loss_ladder()` takes device and rail separately | rung 0 targets `Device.RADIO`; passing a `Rail` where a `Device` belongs raises at construction |
+| F3 | Finiteness validated at the ICD boundary (`RawSample.invalid_devices()` / `power_valid`); non-finite readings record **no evidence in either direction** | `_clean_ticks` stays 0 through 60 NaN ticks; `RESET_FAULTS` refuses; `exit_safe_mode()` refuses; vehicle stays in SAFE |
+| F4 | `EwmaStat.update()` rejects non-finite input and **counts** rejections | baseline survives a NaN and recovers; `rejected == 1` |
+| F5 | `UNKNOWN_ANOMALY` → condition-backed; `RECOVERY_FAILED` → event flag (acknowledgeable) | both clear; clearing `RECOVERY_FAILED` cannot re-arm autonomy, which is held in the campaign state machine |
+| F6 | `Campaign.from_dict()` range-checks values, not just types; `import_recovery_state` also catches `TypeError` | all seven corrupt-state cases discarded; valid state still resumes at rung *k+1* |
+
+### F2 needed a second attempt, and that is the interesting part
+
+The first fix range-checked the target: reject a `RESET_DEVICE` target that is not a
+valid `Device` id. **It did not work, and could not have.** `Rail` ids are 0–4 and
+`Device` ids are 0–3, so every rail except `PAYLOAD` is *simultaneously a valid device
+id*. `Rail.RADIO` is 1; so is `Device.MAG`. A value check can never separate them.
+
+So the target had to become the enum member itself, with the *type* checked. That forced
+a persistence change — a bare integer in NVM cannot be resolved back to the right
+vocabulary — so records now carry `target_kind` and the schema went to version 2. Old v1
+records are refused rather than guessed at, which is correct on its own merits: every v1
+record was written by the code that had this defect.
+
+Worth keeping as a general lesson: **when two id spaces overlap numerically, validation
+by value is theatre.** Only the type carries the information.
+
+### Fixing F2 exposed a test passing for the wrong reason
+
+`test_escalation_moves_through_distinct_rungs_not_blind_repetition` asserted R4 — that a
+recovery ladder must not depend solely on the subsystem it recovers — like this:
+
+```python
+non_radio = [r for r in h.executor.history if r.intent.target != int(Rail.RADIO)]
+```
+
+That was only ever correct *while F2 made rung 0 target a rail too*. With rung 0
+correctly targeting `Device.RADIO` (3), a rail-only comparison counts the radio device
+reset as "non-radio", and the assertion passes **even if the ladder never escalates off
+the radio at all**. The test was quietly load-bearing on the bug.
+
+It now checks both vocabularies and additionally asserts the escape rung is the
+whole-spacecraft reset. This is exactly the self-fulfilling-test category the planned
+`test-integrity` review dimension was meant to hunt, found by accident instead. One
+sample is not a rate, but it is a reason to run that dimension properly.
+
+### Regression coverage
+
+`tests/test_safety_review_regressions.py`, 32 tests, one group per finding. Two are
+deliberately general rather than specific:
+
+- `test_no_flag_is_silently_unclearable` walks **every** `FaultFlag` and requires it to
+  be either resettable or self-clearing, so a newly added flag cannot repeat F1/F5.
+  Checked against the pre-fix flag sets, it fails on four flags — it is not vacuous.
+- `test_corrupt_state_cannot_crash_the_boot` exists because an uncaught exception in NVM
+  restore turns a recoverable data fault into a boot loop, which is worse than the fault.
+
+### What did not change
+
+The ML advisory boundary, the executor/engine split, campaign bounding, and the
+detector thresholds are all untouched. `SENSOR_INVALID` (bit 13) is the only new wire
+bit and carries no authority. The scenario suite's outcome distribution is unchanged and
+its negative assertions are still clean, so none of these fixes moved a measured result.
+
+**Still not reviewed:** protocol parsing, threading, ML internals, scenario-suite
+correctness, and unbounded growth of `FDIREngine.log`. Unchanged from §5 — fixing six
+findings in the areas that *were* examined says nothing about the areas that were not.

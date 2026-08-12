@@ -21,8 +21,10 @@ from hardware_sim import SimulatedPowerPort, SimulatedResetPort  # noqa: E402
 from fdir.engine import FDIREngine  # noqa: E402
 from fdir.executor import RecoveryExecutor  # noqa: E402
 from fdir.ports import RecoveryAction  # noqa: E402
-from fdir.recovery import Campaign, CampaignState, comms_loss_ladder  # noqa: E402
-from icd import FaultFlag, Rail  # noqa: E402
+from fdir.recovery import (  # noqa: E402
+    SYSTEM_TARGET, Campaign, CampaignState, comms_loss_ladder,
+)
+from icd import Device, FaultFlag, Rail  # noqa: E402
 
 DT = 0.1
 
@@ -97,10 +99,27 @@ def test_escalation_moves_through_distinct_rungs_not_blind_repetition():
     rungs_used = {(r.intent.action, r.intent.target) for r in h.executor.history}
     assert len(rungs_used) >= 2, f"expected escalation across rungs, saw only {rungs_used}"
 
-    non_radio = [r for r in h.executor.history if r.intent.target != int(Rail.RADIO)]
+    # R4 must be asserted against BOTH vocabularies. This previously compared
+    # every target against int(Rail.RADIO) alone, which was only ever correct
+    # while the F2 defect made rung 0 target a rail too. With rung 0 correctly
+    # targeting Device.RADIO (3), a rail-only comparison counts the radio
+    # DEVICE reset as "non-radio" and the assertion passes even if the ladder
+    # never escalates off the radio at all -- the exact shape of self-fulfilling
+    # test the safety review was looking for.
+    def targets_radio(rec):
+        t = rec.intent.target
+        if rec.intent.action == RecoveryAction.POWER_CYCLE:
+            return t == Rail.RADIO
+        return t == Device.RADIO
+
+    non_radio = [r for r in h.executor.history if not targets_radio(r)]
     assert non_radio, (
         "every rung targeted the radio -- R4 says a recovery path must not "
         "depend solely on the subsystem it is recovering"
+    )
+    assert any(r.intent.target == SYSTEM_TARGET for r in non_radio), (
+        "the escape rung must be the whole-spacecraft reset, the one action "
+        "that does not need the failed subsystem to be alive"
     )
 
 
@@ -154,8 +173,11 @@ def test_campaign_state_round_trips_through_plain_dict():
     Persistence has to survive a schema change and, later, become a fixed-size
     record in STM32 backup SRAM. Plain dicts, not pickle.
     """
+    # No argument: the ladder names the radio DEVICE and the radio RAIL
+    # separately now. Passing one id for both was the F2 defect, and a bare
+    # int is rejected outright because Rail and Device ids overlap.
     original = Campaign(trigger=int(FaultFlag.COMMS_LOSS),
-                        rungs=comms_loss_ladder(int(Rail.RADIO)),
+                        rungs=comms_loss_ladder(),
                         rung_index=1, attempts_on_rung=1, total_attempts=2)
     restored = Campaign.from_dict(original.to_dict())
 
@@ -204,7 +226,7 @@ def test_reset_midcampaign_resumes_at_next_rung_and_remembers_attempts():
 
 
 def test_restored_campaign_past_its_last_rung_is_exhausted_not_restarted():
-    ladder = comms_loss_ladder(int(Rail.RADIO))
+    ladder = comms_loss_ladder()
     nearly_done = Campaign(trigger=int(FaultFlag.COMMS_LOSS), rungs=ladder,
                            rung_index=len(ladder) - 1, attempts_on_rung=1,
                            total_attempts=4)
