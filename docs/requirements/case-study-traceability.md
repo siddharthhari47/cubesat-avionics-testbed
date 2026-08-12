@@ -115,6 +115,18 @@ commanding a radio power-cycle.
 
 - Code: [`fdir/config.py`](../../fdir/config.py), `FDIREngine.note_link_state()`
 - Scenario: `communication_loss` in [`scenarios/runner.py`](../../scenarios/runner.py)
+- Tests: `tests/test_safety_review_regressions.py::test_an_open_but_silent_link_is_comms_loss`,
+  `::test_the_comms_timeout_is_actually_exercised`
+
+**This claim was weaker than it looked until 2026-08-12.** The safety review (J1/K1)
+found that `note_link_state()` short-circuited on a `connected` boolean the transport
+computed as "a socket object exists", so a link that was open but silent — the exact
+failure this requirement exists for — could never latch `COMMS_LOSS`. The scenario
+suite missed it because the harness fed the engine a clean `link_healthy` verdict
+rather than the heartbeat a real transport produces. Both are fixed, and the fix is
+verified live over the real transport rather than only in the harness: a ground
+station that receives but never transmits latches at ~4.9 s against a 5.0 s timeout,
+while the same link with a heartbeat stays clean.
 
 ---
 
@@ -301,4 +313,7 @@ What that does and does not prove:
 | No degraded modes | R8 | Response granularity is still the whole vehicle |
 | No overcurrent detector on per-rail current | — | The data exists in `RawSample`; nothing consumes it as a detector |
 | No per-channel plausibility check | — | Single-device corruption is currently undetectable |
-| Adversarial safety review of Phases 0–6 not performed | — | Recommended twice, not yet run |
+| No independent adversarial pass over the review's own conclusions | — | Both review rounds were one reviewer auditing their own code; 3 of 10 findings only surfaced because fixing something else disturbed them |
+
+*(The adversarial safety review itself is done — two rounds, ten findings, all fixed.
+See `docs/architecture/v0-adversarial-safety-review.md`.)*

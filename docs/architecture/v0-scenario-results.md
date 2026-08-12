@@ -25,20 +25,38 @@ understand well enough to model, what does the architecture actually do about it
 | Scenario | Detected | Latency (s) | Diagnosis | Correct | Outcome | Actions |
 |---|---|---|---|---|---|---|
 | nominal control | no | — | — | — | **clean** | 0 |
-| radio latch-up *(per-rail sensing)* | yes | 0.10 | `RADIO_LATCHUP` | ✅ | recovered | 2 |
-| radio unresponsive *(per-rail sensing)* | yes | 0.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
-| radio latch-up *(**no** per-rail sensing)* | yes | 0.10 | `GROUND_LINK_LOST` | ❌ | recovered | 2 |
-| radio unresponsive *(**no** per-rail sensing)* | yes | 0.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
+| radio latch-up *(per-rail sensing)* | yes | 5.10 | `RADIO_LATCHUP` | ✅ | recovered | 2 |
+| radio unresponsive *(per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
+| radio latch-up *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ❌ | recovered | 2 |
+| radio unresponsive *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
 | data bus failure | yes | 0.10 | `DATA_PATH` | ✅ | detected_only | 0 |
 | single sensor corrupt | **no** | — | — | — | undetected | 0 |
-| recovery that cannot succeed | yes | 0.10 | `RADIO_LATCHUP` | ✅ | contained | 4 |
-| OBC reset mid-recovery | yes | 0.10 | `RADIO_LATCHUP` | ✅ | contained | 8 |
+| recovery that cannot succeed | yes | 5.10 | `RADIO_LATCHUP` | ✅ | contained | 4 |
+| OBC reset mid-recovery | yes | 5.10 | `RADIO_LATCHUP` | ✅ | contained | 8 |
 | rail overcurrent | **no** | — | `THERMAL` | — | undetected | 0 |
 | undervoltage | yes | 0.30 | `POWER_UNDERVOLTAGE` | ✅ | contained | 0 |
 | thermal excursion | yes | 0.40 | `THERMAL` | ✅ | contained | 0 |
 | sensor frozen | yes | 0.50 | `SENSOR_FROZEN` | ✅ | contained | 0 |
 | sensor not responding | yes | 0.20 | `SENSOR_NOT_RESPONDING` | ✅ | detected_only | 0 |
 | gradual drift | **no** | — | — | — | undetected | 0 |
+
+**Correction, 2026-08-12.** Every comms-driven latency above was previously
+recorded as **0.10 s** and is now **5.10 s**. The old figure was wrong, and
+not by a rounding error — it was an artifact.
+
+`SpacecraftEnvironment.last_ground_contact_t` was initialised to 0.0 and
+advanced by nothing (`note_ground_contact()` existed with no callers), so
+`seconds_since_ground_contact` was really *seconds since boot*. By the time any
+fault was injected it was already past `COMMS_LOSS_TIMEOUT_S`, so `COMMS_LOSS`
+latched on the very first tick of every link drop. **The 5 s debounce was never
+exercised by this suite or by any test.** Found while fixing K1 in the
+adversarial safety review; see `v0-adversarial-safety-review.md` §7.
+
+5.10 s is the honest number: 5.0 s of configured debounce plus one 0.1 s tick.
+The detector is doing exactly what `fdir/config.py` says it should — it simply
+had never been made to prove it. Non-comms latencies (undervoltage 0.30,
+thermal 0.40, lockup 0.50, sensor timeout 0.20, data bus 0.10) are unchanged,
+as are every outcome and the whole negative-assertion column.
 
 **Negative assertions: all clean.** No forbidden flag latched; no forbidden
 action fired. This matters more than the positive column — four of five
