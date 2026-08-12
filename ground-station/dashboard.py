@@ -17,6 +17,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from link import GroundLink, proto  # noqa: E402
+from timeline import build_timeline, flag_authority, summarise  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
@@ -76,7 +77,26 @@ def live_dashboard():
 
     st.markdown(f"### Mode: :{MODE_COLOR[mode]}[{mode.name}]")
     if active_faults:
-        st.error("Active faults: " + ", ".join(active_faults))
+        # Split by AUTHORITY, not just by "is it set". Rendering an advisory
+        # anomaly identically to a flag that can command SAFE made the
+        # architecture's central boundary invisible to the operator -- the
+        # cheapest correction available, and it needs no wire change.
+        commanding = [f for f in active_faults
+                      if flag_authority(getattr(proto.FaultFlag, f)) == "commands SAFE"]
+        authorising = [f for f in active_faults
+                       if flag_authority(getattr(proto.FaultFlag, f)) == "can authorise recovery"]
+        advisory = [f for f in active_faults
+                    if flag_authority(getattr(proto.FaultFlag, f)) == "advisory only"]
+        informational = [f for f in active_faults
+                         if f not in commanding + authorising + advisory]
+        if commanding:
+            st.error("Commands SAFE: " + ", ".join(commanding))
+        if authorising:
+            st.warning("Can authorise recovery: " + ", ".join(authorising))
+        if advisory:
+            st.info("Advisory only (cannot command SAFE or any action): " + ", ".join(advisory))
+        if informational:
+            st.caption("Informational: " + ", ".join(informational))
     else:
         st.success("No active faults")
     if unhealthy:
@@ -123,6 +143,29 @@ def live_dashboard():
         with st.container(border=True):
             st.subheader("Bus current")
             st.line_chart(df, x="t_s", y="bus_current_a")
+
+    with st.container(border=True):
+        st.subheader("FDIR event timeline")
+        st.caption("Reconstructed by diffing consecutive telemetry packets -- this "
+                   "narrative was already on the wire and previously discarded.")
+        events = build_timeline(history)
+        if events:
+            summary = summarise(events)
+            if summary["flag_to_safe_s"] is not None:
+                st.caption(f"first fault `{summary['first_fault']}` at "
+                           f"t={summary['first_fault_t_s']:.2f}s; SAFE entered "
+                           f"{summary['flag_to_safe_s']:.2f}s later")
+            icon = {"critical": ":material/error:", "warning": ":material/warning:",
+                    "recovery": ":material/check_circle:", "info": ":material/info:"}
+            rows = [{"t (s)": round(e.t_s, 2),
+                     "": icon.get(e.severity, ":material/info:"),
+                     "event": e.label,
+                     "kind": e.kind,
+                     "authority": e.authority or "-"}
+                    for e in events[-40:]]
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        else:
+            st.caption("No transitions observed yet.")
 
     with st.container(border=True):
         st.subheader("Command console")
