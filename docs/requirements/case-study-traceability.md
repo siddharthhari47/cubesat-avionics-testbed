@@ -1,0 +1,304 @@
+# Case study → V0 traceability
+
+**Status:** V0, pre-hardware. Every "met" below means *met in simulation, verified by
+an automated test*. Nothing here has run on hardware, because there is no hardware yet.
+
+This document exists to answer one question without anybody having to read the code:
+**which of the requirements derived from real CubeSat failures did V0 actually
+implement, and which did it not?**
+
+The requirements are not invented. They come from
+[`research/cubesat_failure_case_study.md`](../../research/cubesat_failure_case_study.md)
+§18, where each one is derived from a named mission failure. The evidence column there
+is the missions; the evidence column here is the code and the tests.
+
+---
+
+## Summary
+
+| | Count |
+|---|---|
+| Met, verified by test | 8 of 11 |
+| Partially met | 1 (R10) |
+| Not met, deliberately deferred | 2 (R7, R8) |
+
+Two requirements are unmet and that is stated plainly rather than softened. Neither
+was forgotten; both are recorded in §5 below with what it would take to close them.
+
+---
+
+## 1. Requirement-by-requirement
+
+### R1 — Every autonomous action passes a deterministic safety gate
+**Evidence in case study:** existing project principle, unchallenged by the data.
+**Status: MET.**
+
+No recovery action reaches hardware without deterministic authority. `FDIREngine`
+emits a `RecoveryIntent`; `RecoveryExecutor` is the only thing that commands a port.
+The gate is `RECOVERY_AUTHORITY_FLAGS` in [`fdir/engine.py`](../../fdir/engine.py) —
+an explicit allow-list of flags permitted to authorise an action.
+
+- Code: [`fdir/engine.py`](../../fdir/engine.py) (`RECOVERY_AUTHORITY_FLAGS`),
+  [`fdir/executor.py`](../../fdir/executor.py), [`fdir/ports.py`](../../fdir/ports.py)
+- Tests: `tests/test_recovery_seam.py`, `tests/test_diagnosis.py::test_unknown_anomaly_flag_is_raised_and_no_action_is_taken`
+
+The engine-emits-intents split is what makes this checkable at all: `FDIREngine.tick()`
+is a pure function of state, so "could this flag have caused that action" is answerable
+by reading one constant instead of tracing call sites.
+
+---
+
+### R2 — Every recovery action has an explicit verification condition
+**Evidence in case study:** KySat-2.
+**Status: MET.**
+
+Every rung of a recovery campaign carries a `VerifyCondition` that is checked against
+*subsequent telemetry*, not against whether the command was accepted. This is the
+distinction KySat-2 turned on: a command that is accepted is not a fault that is fixed.
+
+- Code: [`fdir/recovery.py`](../../fdir/recovery.py) (`VerifyCondition`, `Rung`),
+  `FDIREngine._advance_campaign`
+- Test: `tests/test_recovery_phase5.py::test_verification_is_observed_not_assumed_from_command_acceptance`
+
+`RecoveryExecutor` deliberately does **not** decide success. It reports
+`engine.note_action_completed(now, accepted)` and nothing more; the engine decides,
+from telemetry, in a later tick.
+
+---
+
+### R3 — A failed recovery action must not be blindly repeated; escalate instead
+**Evidence in case study:** KySat-2.
+**Status: MET.**
+
+Campaigns are ladders of *distinct* rungs with bounded retries per rung. Exhausting
+the ladder raises `RECOVERY_FAILED` rather than looping.
+
+- Code: [`fdir/recovery.py`](../../fdir/recovery.py) (`Campaign`, `CampaignState`),
+  `comms_loss_ladder()`
+- Tests: `tests/test_recovery_phase5.py::test_escalation_moves_through_distinct_rungs_not_blind_repetition`,
+  `::test_unrecoverable_fault_is_bounded_and_ends_in_recovery_failed`
+
+Campaign state is NVM-persisted and resumes at rung *k+1*, so a reset mid-campaign
+does not restart the ladder from the bottom — the failure mode that turns a bounded
+retry into an unbounded one across reboots.
+
+- Tests: `::test_reset_midcampaign_resumes_at_next_rung_and_remembers_attempts`,
+  `::test_restored_campaign_past_its_last_rung_is_exhausted_not_restarted`,
+  `::test_unreadable_persisted_state_is_discarded_not_trusted`
+
+---
+
+### R4 — Recovery paths must not depend solely on the subsystem they recover
+**Evidence in case study:** CSSWE.
+**Status: MET.**
+
+`comms_loss_ladder()` escalates *away* from the radio: reset the radio device →
+power-cycle the radio rail → system reset. The final rung does not route through the
+radio at all. CSSWE is the case where the correct action existed, was proven to work,
+and was never commanded — the ladder's last rung is the one that does not need the
+failed subsystem to be alive.
+
+- Code: [`fdir/recovery.py`](../../fdir/recovery.py) `comms_loss_ladder()`
+- Test: `tests/test_recovery_phase5.py::test_escalation_moves_through_distinct_rungs_not_blind_repetition`
+
+---
+
+### R5 — Loss of ground contact is itself a fault condition with an autonomous response
+**Evidence in case study:** CSSWE.
+**Status: MET.**
+
+`COMMS_LOSS` is a first-class detector with recovery authority, and
+`COMMS_RECOVERY_TRIGGER_S` (30 s) is deliberately distinct from
+`COMMS_LOSS_TIMEOUT_S` (5 s): flagging the condition and acting on it are separate
+decisions with separate thresholds, so a brief dropout raises awareness without
+commanding a radio power-cycle.
+
+- Code: [`fdir/config.py`](../../fdir/config.py), `FDIREngine.note_link_state()`
+- Scenario: `communication_loss` in [`scenarios/runner.py`](../../scenarios/runner.py)
+
+---
+
+### R6 — Detectors must distinguish subsystem fault from data-path fault
+**Evidence in case study:** Delfi-C3.
+**Status: MET.**
+
+This one was a live defect (D3) before Phase 4: the engine diagnosed a dead I²C bus as
+a dead IMU, which is precisely the Delfi-C3 misdiagnosis. `_suspect_devices()` /
+`_update_data_path()` / `_channel_trusted()` now discriminate by bus membership, and
+`diagnose()` ranks `DATA_PATH` above the symptoms beneath it.
+
+- Code: [`fdir/engine.py`](../../fdir/engine.py), [`fdir/diagnosis.py`](../../fdir/diagnosis.py)
+- Tests: `tests/test_diagnosis.py::test_bus_failure_is_diagnosed_as_the_path_not_the_devices`,
+  `::test_diagnosis_prefers_the_path_over_the_symptoms_beneath_it`,
+  `::test_bus_failure_does_not_command_safe`
+- Scenario pair: `data_bus_failure` vs. a single-device partner — one device failing
+  correctly *is* a device fault, so the pair is what proves isolation rather than
+  detection.
+
+---
+
+### R7 — Slow-drift detection must use a fixed reference, not only an adaptive one
+**Evidence in case study:** QuakeSat, plus this project's own measured EWMA blind spot.
+**Status: NOT MET.**
+
+V0 has adaptive baselines only. A sufficiently slow drift is learned as normal — the
+exact blind spot the case study names. `MIN_ADAPTIVE_SAMPLES` fixes the cold-start
+false positive, which is a different problem and does not address this one.
+
+Partial mitigation exists and should not be mistaken for a fix: the `gradual_drift`
+scenario is detected, but by the *fixed* undervoltage threshold once the drift has
+gone far enough — that is, by a deterministic detector doing its job late, not by
+drift detection. See `docs/architecture/v0-scenario-results.md`.
+
+**To close:** a fixed-reference comparator per drifting channel, with the reference
+captured at commissioning rather than learned in flight. Not V0 scope.
+
+---
+
+### R8 — Degraded modes must be pre-validated and autonomously selectable
+**Evidence in case study:** BIRD, Odin, QuakeSat.
+**Status: NOT MET.**
+
+There are four modes (BOOT, NOMINAL, SAFE, TEST) and none of them is degraded. The
+response granularity is still the whole vehicle: the system can run or it can sit in
+SAFE. BIRD's lesson — that graceful degradation preserved the mission — is
+acknowledged and not implemented.
+
+Worth stating precisely: BIRD's degradation was *ground-authored*, not autonomous.
+So R8 asks for something no mission in the dataset actually demonstrated
+autonomously. That does not make it wrong, but it does mean implementing it is
+research, not replication.
+
+**To close:** per-rail shed policies with pre-validated capability sets, plus a
+selection rule. Depends on hardware for anything credible, since "pre-validated"
+means measured.
+
+---
+
+### R9 — Safe mode must have an exit strategy, not only an entry condition
+**Evidence in case study:** CAPSTONE.
+**Status: MET.**
+
+Exiting SAFE requires **both** that the triggering condition has cleared for a full
+evidence window **and** an explicit `RESET_FAULTS`. Clearing the physical condition
+alone is not sufficient, and neither is the command alone.
+
+- Code: `FDIREngine.reset_faults()` → returns `(cleared, still_latched)`;
+  `_has_cleared()` / `_clean_ticks`
+- Tests: `tests/test_fdir.py::test_exit_safe_mode_requires_condition_clear_and_reset_faults`
+
+Verified live in Phase 8: after the injected undervoltage was cleared, the vehicle
+stayed in SAFE with `UNDERVOLTAGE_CRITICAL` latched, correctly.
+
+D2 and D4 were both defects against this requirement — `reboot → RESET_FAULTS →
+EXIT_SAFE_MODE` used to return a still-faulted vehicle, and `RESET_FAULTS` used to
+ACK `ACCEPTED` even when it cleared nothing. Both fixed in Phase 0;
+`AckStatus.REJECTED_CONDITION_STILL_ACTIVE` now exists so the ground station is told
+the truth.
+
+---
+
+### R10 — The system must represent "cause unknown" explicitly and act conservatively
+**Evidence in case study:** 63% of the record — the single largest bucket.
+**Status: PARTIALLY MET.**
+
+The representation exists and is honest: `diagnose()` returns `Cause.UNKNOWN` rather
+than inventing a cause, `UNKNOWN_ANOMALY` latches when something is flagged and no
+rule explains it, and `Diagnosis.authorises_action` requires `LIKELY` confidence, so
+an unknown cause authorises nothing.
+
+- Code: [`fdir/diagnosis.py`](../../fdir/diagnosis.py), `FDIREngine` (`_UNEXPLAINED_FLAGS`)
+- Tests: `tests/test_diagnosis.py::test_advisory_only_evidence_yields_unknown_not_an_invented_cause`,
+  `::test_unknown_anomaly_flag_is_raised_and_no_action_is_taken`
+
+**Why "partial" and not "met":** no scenario in the suite drives the UNKNOWN path
+end-to-end — `unknown_held` is 0 across all 15 scenarios. The path is unit-tested but
+never exercised by the integrated system, so "acts conservatively when it does not
+know" is an asserted property, not a demonstrated one. Given this requirement traces
+to the *largest* category in the dataset, that gap is the most consequential one on
+this page.
+
+**To close:** a scenario injecting a fault signature the rule set deliberately does
+not cover, asserting UNKNOWN is held and no action is taken.
+
+---
+
+### R11 — ML must not command irreversible actions
+**Evidence in case study:** unchallenged; reinforced by §14.
+**Status: MET.** *(The only requirement already satisfied before this work began.)*
+
+`ML_ANOMALY` and `ADAPTIVE_ANOMALY` appear in neither `SAFE_MODE_TRIGGER_FLAGS` nor
+`RECOVERY_AUTHORITY_FLAGS`. They can raise a flag, appear in telemetry, and inform an
+operator. They cannot change mode and cannot command an action.
+
+- Code: [`fdir/engine.py`](../../fdir/engine.py)
+- Tests: `tests/test_fdir.py::test_ml_advisory_never_autonomously_forces_safe`,
+  `::test_advisory_only_flag_cannot_command_safe_at_end_of_boot`,
+  `tests/test_timeline.py::test_advisory_flags_never_overlap_the_authority_sets`
+- Firmware: the exported C header's `isolation_forest_is_anomalous()` carries the
+  same constraint in its comment block.
+- Ground station: since Phase 8 the dashboard renders flags grouped by *authority*,
+  so an advisory anomaly no longer looks identical to a critical undervoltage.
+
+The boundary is enforced in three places and asserted in two test files, deliberately.
+Of the five documented FDIR failures in the case study, four were failures of
+authority, isolation, or verification — not of detection.
+
+---
+
+## 2. The findings that shaped the architecture, not just the requirements
+
+Three results from the case study changed design decisions rather than adding
+requirements. Recorded here because they are invisible in the code:
+
+**63% of NASA-catalogued CubeSat failures have no stated technical cause, and 16% of
+missions were never heard from at all.** This bounds what *any* onboard autonomy can
+address, and it is why R10 exists and why no percentage-of-failures-solved claim
+appears anywhere in this repository.
+
+**Four of five documented FDIR failures were failures of authority, isolation, or
+verification — not detection.** This cuts directly against the project's founding
+instinct that better detection is the lever. It is why Phases 3–5 (ports, diagnosis,
+recovery campaigns) came before Phase 7 (ML), and why ML was scheduled last and
+non-blocking.
+
+**CSSWE is one clean, validated opportunity:** the correct recovery action existed,
+was proven to work, and was never commanded autonomously. One case is not a trend,
+and it is presented as one case.
+
+---
+
+## 3. What V0 deliberately did not build
+
+- **ML #2** — case study §19 concludes it is not justified yet. A clean interface
+  seam exists; no implementation. Deliberate, per the brief.
+- **Attitude-based radiation mitigation** — rejected as unsupported by §9.
+- **ML-driven diagnosis as a primary capability** — deferred, not dismissed (§14).
+
+---
+
+## 4. Verification status of the claims on this page
+
+Everything marked MET has an automated test named above. Suite: **249 passing**.
+
+What that does and does not prove:
+
+- It proves the logic behaves as specified **against a simulator I also wrote**.
+  A shared misconception between simulator and engine would not be caught.
+- It does not prove any timing number transfers to hardware. Detection latencies
+  measured here are simulation latencies.
+- The scenario suite's outcomes are in `docs/architecture/v0-scenario-results.md`,
+  including the scenarios where the finding *is* that nothing latched.
+
+---
+
+## 5. Open gaps, ranked
+
+| Gap | Requirement | Why it matters |
+|---|---|---|
+| No scenario drives the UNKNOWN path end-to-end | R10 | Traces to 63% of the dataset — the largest bucket, least demonstrated |
+| No fixed-reference drift detection | R7 | Adaptive-only baselines learn slow drift as normal |
+| No degraded modes | R8 | Response granularity is still the whole vehicle |
+| No overcurrent detector on per-rail current | — | The data exists in `RawSample`; nothing consumes it as a detector |
+| No per-channel plausibility check | — | Single-device corruption is currently undetectable |
+| Adversarial safety review of Phases 0–6 not performed | — | Recommended twice, not yet run |
