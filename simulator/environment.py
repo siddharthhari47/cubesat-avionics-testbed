@@ -129,6 +129,13 @@ FAULT_TYPES = (
     "rail_overcurrent",  # a load eats the battery while voltage thresholds stay happy
     "communication_loss",  # link down, everything else healthy
     "data_bus_failure",    # Delfi-C3: the PATH fails, the devices are fine
+    # The CONTROL for radio_latchup: identical comms symptom, nominal current.
+    # Without this pair, radio_latchup is a detection test rather than an
+    # isolation test -- and isolation is what four of five documented FDIR
+    # failures actually lacked.
+    "radio_unresponsive",
+    # The single-device partner to data_bus_failure.
+    "sensor_corruption",
 )
 
 
@@ -183,6 +190,7 @@ class SpacecraftEnvironment:
         # simulation that models this by breaking three sensors has built three
         # sensor faults, not a bus fault, and proves nothing about isolation.
         self.bus_healthy: Dict[int, bool] = {b: True for b in Bus}
+        self.mag_corrupt = False
         self.link_healthy = True
         self.last_ground_contact_t = 0.0
 
@@ -212,6 +220,14 @@ class SpacecraftEnvironment:
             self.link_healthy = False
         elif fault_name == "data_bus_failure":
             self.bus_healthy[Bus.I2C_A] = False
+        elif fault_name == "radio_unresponsive":
+            # Deliberately NOT latched and NOT drawing extra current: the whole
+            # point is that this is indistinguishable from radio_latchup on the
+            # link alone, and separable only by per-rail current.
+            self.device_responsive["radio"] = False
+            self.link_healthy = False
+        elif fault_name == "sensor_corruption":
+            self.mag_corrupt = True
 
     def clear(self, fault_name: str) -> None:
         """
@@ -235,6 +251,11 @@ class SpacecraftEnvironment:
             self.link_healthy = True
         elif fault_name == "data_bus_failure":
             self.bus_healthy[Bus.I2C_A] = True
+        elif fault_name == "radio_unresponsive":
+            self.device_responsive["radio"] = True
+            self.link_healthy = True
+        elif fault_name == "sensor_corruption":
+            self.mag_corrupt = False
         elif fault_name == "gradual_drift":
             self.battery_r_internal_ohm = BATTERY_R_NOMINAL_OHM
         elif fault_name == "undervoltage":
@@ -410,6 +431,10 @@ class SpacecraftEnvironment:
         # that stopped answering, and collapsing the two would erase the very
         # distinction this fault exists to test.
         mag_reported = (25.0 + mag_noise[0], -8.0 + mag_noise[1], 40.0 + mag_noise[2])
+        if self.mag_corrupt:
+            # ONE device corrupt, its bus fine. Pairs with data_bus_failure: the
+            # correct diagnosis here is the device, not the path.
+            mag_reported = (0.0, 0.0, 0.0)
         if not self.bus_healthy[Bus.I2C_A]:
             members = {Device.IMU, Device.MAG, Device.TEMP}
             if Device.IMU in members:
