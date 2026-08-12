@@ -61,6 +61,24 @@ LOCKUP_WINDOW_SAMPLES = 5
 
 MAX_FALSE_SAFE_ENTRIES_PER_6H = 1
 
+# --- autonomous recovery trigger (CSSWE / R5) ---------------------------------
+# DELIBERATELY DISTINCT from COMMS_LOSS_TIMEOUT_S, and conflating the two would
+# be a real bug. That one (5 s) is a link heartbeat: it decides when to *flag*
+# loss of contact. This one decides when to *act* on it. The case study's CSSWE
+# inference is "no ground contact for N hours" -- reusing the 5 s heartbeat as
+# the action trigger would power-cycle the radio every five seconds.
+#
+# This value is a TEST-SCALE default so scenarios run in seconds. A flight value
+# would be hours, and the recovery logic must not be tuned to either -- the
+# scenario suite runs the same ladder at test and flight-plausible timings to
+# prove it isn't.
+COMMS_RECOVERY_TRIGGER_S = 30.0
+
+# How long power must be removed for a latch-up to clear. Mirrors the physical
+# constant in simulator/environment.py; on real hardware this is a property of
+# the part, to be measured rather than assumed.
+POWER_CYCLE_OFF_TIME_S = 0.150
+
 # --- reset evidence (D2) -------------------------------------------------------
 # RESET_FAULTS may only clear a latched flag on POSITIVE evidence that the
 # condition has gone away -- this many consecutive non-breaching observations --

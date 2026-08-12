@@ -40,9 +40,10 @@ from typing import Dict, List, Optional, Tuple
 # present, formed an import cycle with simulator/environment.py, and produced two
 # distinct FaultFlag classes at runtime. See icd/__init__.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from icd import FaultFlag, HealthFlag, Mode, RawSample  # noqa: E402,F401
+from icd import FaultFlag, HealthFlag, Mode, Rail, RawSample  # noqa: E402,F401
 
 from . import config as cfg
+from .ports import RecoveryAction, RecoveryIntent
 
 # Faults allowed to autonomously force NOMINAL/TEST -> SAFE. Deliberately
 # excludes ADAPTIVE_ANOMALY (a *statistical* detector, kept advisory-only since
@@ -65,6 +66,24 @@ CONDITION_BACKED_FLAGS = (
 EVENT_FLAGS = FaultFlag.WATCHDOG_RESET | FaultFlag.CORRUPTED_PACKET
 
 RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
+
+# Flags permitted to AUTHORISE AN AUTONOMOUS RECOVERY ACTION.
+#
+# This is a separate gate from SAFE_MODE_TRIGGER_FLAGS and must stay separate.
+# That one governs a mode transition -- changing a variable. This one governs
+# commanding hardware, which is a strictly stronger permission, and the V0
+# audit flagged that a mode gate does not generalise to an action gate just
+# because it happens to be the only gate that exists today.
+#
+# ADAPTIVE_ANOMALY and ML_ANOMALY are excluded, as they are from SAFE authority.
+# A statistical or learned detector may raise a flag that a human sees; it may
+# not cause the spacecraft to switch a rail. That is the project's central
+# principle applied to actions rather than only to modes, and it is enforced
+# here in code with a test that fails if either bit is added.
+RECOVERY_AUTHORITY_FLAGS = (
+    FaultFlag.COMMS_LOSS | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
+    | FaultFlag.SENSOR_LOCKUP | FaultFlag.SENSOR_TIMEOUT
+)
 
 
 @dataclass
@@ -128,6 +147,12 @@ class FDIREngine:
         # a reset must not be able to manufacture evidence by erasing state.
         self._clean_ticks: Dict[int, int] = {}
 
+        # Recovery requests awaiting an executor. The engine never actuates
+        # anything itself -- see fdir/ports.py for why the seam is here.
+        self.pending_intents: List[RecoveryIntent] = []
+        self._comms_loss_since: Optional[float] = None
+        self._comms_intent_issued = False
+
     # ---- lifecycle -------------------------------------------------
 
     def start_boot(self, now: float) -> None:
@@ -189,6 +214,8 @@ class FDIREngine:
         if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS and self.mode in (Mode.NOMINAL, Mode.TEST):
             self.mode = Mode.SAFE
             self._emit(now, f"-> SAFE: {FaultFlag(self.fault_flags & SAFE_MODE_TRIGGER_FLAGS)!r}")
+
+        self._update_recovery_proposals(now)
 
     # ---- individual detectors -------------------------------------------------
     # Each latches its FaultFlag bit once its debounce window is satisfied, and
@@ -346,6 +373,65 @@ class FDIREngine:
             if not self.fault_flags & FaultFlag.COMMS_LOSS:
                 self._emit(now, f"COMMS_LOSS latched (no ground contact for >= {cfg.COMMS_LOSS_TIMEOUT_S} s)")
             self.fault_flags |= FaultFlag.COMMS_LOSS
+
+    # ---- recovery proposals -------------------------------------------------
+
+    def _propose(self, now: float, action: RecoveryAction, target: int,
+                 authorising_flags: FaultFlag, reason: str) -> bool:
+        """
+        Queue a recovery request. Returns False if the proposal is refused.
+
+        The authority check is the point of this method existing: a caller must
+        name which latched flags justify the action, and at least one of them
+        must carry recovery authority. A proposal justified only by an advisory
+        detector (ADAPTIVE_ANOMALY, ML_ANOMALY) is refused here, in one place,
+        rather than relying on every future producer to remember the rule.
+        """
+        if not (authorising_flags & RECOVERY_AUTHORITY_FLAGS):
+            self._emit(now, f"recovery proposal REFUSED ({reason}): "
+                            f"{FaultFlag(authorising_flags)!r} carries no recovery authority")
+            return False
+        self.pending_intents.append(
+            RecoveryIntent(action=action, target=target, reason=reason, requested_at=now)
+        )
+        self._emit(now, f"recovery proposed: {action.name} on device {target} ({reason})")
+        return True
+
+    def _update_recovery_proposals(self, now: float) -> None:
+        """
+        The CSSWE rule, and currently the only producer.
+
+        Loss of ground contact is treated as a fault condition with an
+        autonomous response, because the one thing the ground cannot fix is the
+        radio it would have to talk through. Note the trigger is
+        COMMS_RECOVERY_TRIGGER_S, NOT the COMMS_LOSS_TIMEOUT_S heartbeat --
+        flagging the loss and acting on it are deliberately different timescales.
+
+        Bounded retries, verification of the outcome and escalation when it
+        fails are Phase 5. This proposes once per loss episode so it cannot spam,
+        which is a placeholder for that policy, not a substitute for it.
+        """
+        if not self.fault_flags & FaultFlag.COMMS_LOSS:
+            self._comms_loss_since = None
+            self._comms_intent_issued = False
+            return
+        if self._comms_loss_since is None:
+            self._comms_loss_since = now
+            return
+        if self._comms_intent_issued:
+            return
+        if now - self._comms_loss_since >= cfg.COMMS_RECOVERY_TRIGGER_S:
+            issued = self._propose(
+                now, RecoveryAction.POWER_CYCLE, int(Rail.RADIO),
+                FaultFlag.COMMS_LOSS,
+                f"no ground contact for >= {cfg.COMMS_RECOVERY_TRIGGER_S} s",
+            )
+            self._comms_intent_issued = issued
+
+    def take_pending_intents(self) -> List[RecoveryIntent]:
+        """Drain the queue. The executor calls this; nothing else should."""
+        intents, self.pending_intents = self.pending_intents, []
+        return intents
 
     def note_corrupted_packet(self, now: float) -> None:
         """Report that the transport rejected a packet on integrity grounds (COM-004)."""
