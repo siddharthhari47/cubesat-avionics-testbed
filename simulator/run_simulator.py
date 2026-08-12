@@ -30,6 +30,56 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from fdir.engine import FDIREngine, MLAdvisory  # noqa: E402
 
+
+def _load_ml_detector():
+    """
+    Optional ML #1. Returns (extractor, model, threshold) or None.
+
+    Deliberately optional and deliberately failing soft: the deterministic FDIR
+    layer is the safety-critical path and must run whether or not a model is
+    present or loadable. An advisory detector that can prevent the spacecraft
+    from booting would be worse than no advisory detector.
+    """
+    try:
+        import joblib
+        from ml.features import feature_columns
+        from ml.streaming import StreamingFeatureExtractor
+        model_path = Path(__file__).resolve().parent.parent / "ml" / "models" / "isolation_forest_v1.joblib"
+        if not model_path.exists():
+            return None
+        model = joblib.load(model_path)
+
+        # Verify FEATURE ORDER once, here, instead of never.
+        #
+        # The model was fitted on a named DataFrame; the streaming path feeds it
+        # a bare ndarray, so sklearn emitted "X does not have valid feature
+        # names" on every single tick. That warning is not cosmetic -- it is
+        # sklearn saying it cannot check that column 7 is still the column it
+        # trained on. Silencing it would have thrown away the only signal that
+        # a reordered feature list had silently invalidated every score.
+        #
+        # So do the check the warning was asking for, once at load, and fail
+        # soft if it does not hold. Same property the exported C header depends
+        # on (see ml/export_embedded.py's ordered feature comment).
+        expected = list(getattr(model, "feature_names_in_", []))
+        if expected and expected != list(feature_columns()):
+            print("[sim] ML #1 REJECTED: feature order does not match the trained "
+                  "model. Scores would be meaningless. Running deterministic "
+                  "FDIR only.")
+            return None
+
+        # Order is now verified, so the per-tick warning is pure noise -- and at
+        # 10 Hz it buried every real [sim] line in the log. Suppress only this
+        # exact message, never warnings broadly.
+        import warnings
+        warnings.filterwarnings(
+            "ignore", message="X does not have valid feature names",
+            category=UserWarning)
+        return StreamingFeatureExtractor(), model
+    except Exception as exc:      # noqa: BLE001 - advisory path, never fatal
+        print(f"[sim] ML #1 unavailable ({exc}); running deterministic FDIR only")
+        return None
+
 from environment import SpacecraftEnvironment, FAULT_TYPES  # noqa: E402
 from protocol import (  # noqa: E402
     AckPacket, AckStatus, CommandId, CommandPacket, FaultFlag, HealthFlag, Mode,
@@ -38,10 +88,13 @@ from protocol import (  # noqa: E402
 
 
 class Simulator:
-    def __init__(self, telemetry_rate_hz: float, seed=None):
+    def __init__(self, telemetry_rate_hz: float, seed=None, use_ml: bool = False):
         self.lock = threading.Lock()
         self.env = SpacecraftEnvironment(seed=seed)
         self.engine = FDIREngine()
+        self._ml = _load_ml_detector() if use_ml else None
+        if self._ml is not None:
+            print("[sim] ML #1 loaded (advisory only -- no SAFE or recovery authority)")
         self.boot_time = time.monotonic()      # for the wire timestamp_ms field only
         self.process_start = time.monotonic()
         self.seq_num = 0
@@ -61,11 +114,30 @@ class Simulator:
         with self.lock:
             now = time.monotonic()
             sample, _truth = self.env.step(1.0 / self.telemetry_rate_hz)
-            # ml_advisory=None until ml/ produces one at V1+; the hook already
-            # exists end to end (see fdir/engine.py's SAFE_MODE_TRIGGER_FLAGS).
-            self.engine.tick(sample, now, ml_advisory=None)
+            self.engine.tick(sample, now, ml_advisory=self._ml_advisory(sample))
             self._update_comms_loss(now)
             return self._build_packet(sample)
+
+    def _ml_advisory(self, sample):
+        """
+        Run ML #1 over the streaming feature extractor.
+
+        Returns None while the rolling window is still filling. That is not a
+        convenience: on the first samples after any reset every rolling standard
+        deviation is 0.0, which is exactly the frozen-sensor signature the model
+        detects best -- so emitting a partial-window vector would manufacture
+        the strongest anomaly in the model's repertoire at every boot.
+        """
+        if self._ml is None:
+            return None
+        extractor, model = self._ml
+        vector = extractor.push(sample)
+        if vector is None:
+            return None
+        import numpy as np
+        x = np.asarray([vector])
+        score = float(model.decision_function(x)[0])
+        return MLAdvisory(score=score, is_anomalous=bool(model.predict(x)[0] == -1))
 
     def _update_comms_loss(self, now):
         # The transport OBSERVES the link and reports it; the engine DECIDES
@@ -254,9 +326,12 @@ def main():
     parser.add_argument("--port", type=int, default=5555)
     parser.add_argument("--rate", type=float, default=1.0, help="initial telemetry rate, Hz")
     parser.add_argument("--seed", type=int, default=None, help="RNG seed for reproducible runs")
+    parser.add_argument("--ml", action="store_true",
+                        help="enable ML #1 advisory detection (advisory only; "
+                             "it can raise a flag but never command SAFE or a recovery action)")
     args = parser.parse_args()
 
-    sim = Simulator(telemetry_rate_hz=args.rate, seed=args.seed)
+    sim = Simulator(telemetry_rate_hz=args.rate, seed=args.seed, use_ml=args.ml)
     stop_event = threading.Event()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -60,6 +60,20 @@
 #define ANOMALY_MODEL_N_TREES 50
 static const float ANOMALY_MODEL_C_NORM = 10.24477092f;
 
+/* Decision threshold, converted to THIS file's sign convention.
+ *
+ * Without this the header exported a score and no cutoff, so firmware
+ * could compute a number and had no way to turn it into a decision.
+ *
+ * Derivation: sklearn's predict() returns anomalous iff
+ *     decision_function = score_samples - offset_ < 0
+ * and score_samples = -s_paper, so
+ *     anomalous  <=>  s_paper > -offset_
+ * offset_ was set at fit time from the contamination hyperparameter; it
+ * is NOT a calibrated probability cutoff. See the evaluation report.
+ */
+static const float ANOMALY_MODEL_THRESHOLD = 0.5040094287f;
+
 /* --- tree 0: 83 nodes --- */
 static const int16_t tree0_feature[] = {23, 9, 10, -2, 5, -2, 34, -2, -2, -2, 2, 35, 33, 29, 26, 24, 30, -2, -2, 12, -2, -2, 6, 7, -2, -2, -2, 34, 28, 19, -2, -2, 15, -2, -2, 2, 30, -2, -2, 17, -2, -2, 23, 9, 12, 32, -2, -2, 2, -2, -2, 26, 10, -2, -2, 26, -2, -2, -2, -2, 16, 33, -2, 5, -2, -2, 27, -2, 17, -2, 3, 0, 6, -2, -2, 2, -2, -2, 13, 20, -2, -2, -2};
 static const float tree0_threshold[] = {0.35165906f, 0.99913914f, 0.99583878f, -2.00000000f, 0.01085630f, -2.00000000f, 0.39748814f, -2.00000000f, -2.00000000f, -2.00000000f, 0.35594989f, 0.03580566f, 0.41349762f, 0.54958794f, 1.32234874f, -7.68993597f, 5.04097907f, -2.00000000f, -2.00000000f, 0.07488027f, -2.00000000f, -2.00000000f, -0.00392867f, 0.00034921f, -2.00000000f, -2.00000000f, -2.00000000f, 0.39069971f, 39.78327128f, -0.23899876f, -2.00000000f, -2.00000000f, 0.06258498f, -2.00000000f, -2.00000000f, 0.32997798f, 5.05073133f, -2.00000000f, -2.00000000f, 0.40026467f, -2.00000000f, -2.00000000f, 1.70051452f, 1.01073496f, -0.91050628f, 0.01149600f, -2.00000000f, -2.00000000f, 0.30456249f, -2.00000000f, -2.00000000f, 0.93911672f, 1.00264332f, -2.00000000f, -2.00000000f, 1.64433773f, -2.00000000f, -2.00000000f, -2.00000000f, -2.00000000f, -0.39942527f, 0.36658160f, -2.00000000f, 0.00752507f, -2.00000000f, -2.00000000f, 37.94426992f, -2.00000000f, 0.09526745f, -2.00000000f, 0.01257597f, 24.67642529f, -0.01621882f, -2.00000000f, -2.00000000f, 0.37978232f, -2.00000000f, -2.00000000f, 0.20867182f, 0.50426913f, -2.00000000f, -2.00000000f, -2.00000000f};
@@ -504,6 +518,21 @@ static float isolation_forest_score(const float *x) {
     }
     float avg_path_length = total_path_length / (float)ANOMALY_MODEL_N_TREES;
     return powf(2.0f, -avg_path_length / ANOMALY_MODEL_C_NORM);
+}
+
+
+/* True if the feature vector should be treated as anomalous.
+ *
+ * Defined AFTER isolation_forest_score deliberately -- C requires the
+ * callee to be declared first, and an earlier revision of this generator
+ * emitted it above the score function, which would not have compiled.
+ *
+ * ADVISORY ONLY. The FDIR port must route this through the same debounced
+ * latch every deterministic detector uses. FAULT_ML_ANOMALY carries
+ * neither SAFE-mode authority nor recovery-action authority, and any C
+ * port that grants it either has broken the architecture. */
+static int isolation_forest_is_anomalous(const float *x) {
+    return isolation_forest_score(x) > ANOMALY_MODEL_THRESHOLD;
 }
 
 #endif /* CUBESAT_ANOMALY_MODEL_H */

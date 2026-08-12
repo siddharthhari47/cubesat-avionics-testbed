@@ -26,11 +26,13 @@ import joblib
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ml.features import build_features  # noqa: E402
 from fdir.engine import FDIREngine, RawSample  # noqa: E402
+from fdir import config as cfg  # noqa: E402
 from simulator.protocol import FaultFlag  # noqa: E402
 from simulator.dataset_gen import generate_dataset, FAULT_ONSET_S, FAULT_CLEAR_S  # noqa: E402
 
@@ -46,6 +48,18 @@ FAULT_TO_EXPECTED_FLAG = {
     "sensor_timeout": FaultFlag.SENSOR_TIMEOUT,
     "gradual_drift": FaultFlag.ADAPTIVE_ANOMALY,
 }
+
+
+def _debounce(preds, n: int):
+    """
+    Latch anomalous only after n CONSECUTIVE anomalous samples -- exactly what
+    fdir/engine.py's _update_ml_advisory does. Returns -1/1 like predict().
+    """
+    out, run = [], 0
+    for p in preds:
+        run = run + 1 if p == -1 else 0
+        out.append(-1 if run >= n else 1)
+    return out
 
 
 def row_to_raw_sample(row) -> RawSample:
@@ -96,7 +110,14 @@ def evaluate_fault_type(fault_type, episodes, model):
 
         feats = build_features(ep_df)
         preds = model.predict(feats)  # -1 = anomalous, 1 = normal
-        ml_rows = list(zip(ep_df["t"].tolist(), preds.tolist()))
+        # Apply the SAME debounce FDIR applies (D8). The previous version
+        # measured raw per-sample predict() output while fdir/engine.py requires
+        # ML_ANOMALY_DEBOUNCE_SAMPLES consecutive anomalous samples before the
+        # flag latches -- so every latency and recall figure described a detector
+        # configuration the system does not actually run. At 3-4% per-sample
+        # rates, three-in-a-row is a fundamentally different event.
+        debounced = _debounce(preds, cfg.ML_ANOMALY_DEBOUNCE_SAMPLES)
+        ml_rows = list(zip(ep_df["t"].tolist(), debounced))
         t_ml = first_detection_time(ml_rows, FAULT_ONSET_S, window_end, lambda p: p == -1)
         if t_ml is not None:
             ml_detected += 1
@@ -111,7 +132,7 @@ def evaluate_fault_type(fault_type, episodes, model):
         # is what shows whether there is real signal.
         active = ep_df["fault_active"].values
         if active.any():
-            ml_flagged_samples += int((preds[active] == -1).sum())
+            ml_flagged_samples += int((np.asarray(debounced)[active] == -1).sum())
             fault_active_samples += int(active.sum())
 
     n = len(episodes)
@@ -153,7 +174,8 @@ def evaluate_false_positives(nominal_episodes, model):
             fdir_false_episodes += 1
 
         feats = build_features(ep_df)
-        preds = model.predict(feats)
+        preds = _debounce(model.predict(feats), cfg.ML_ANOMALY_DEBOUNCE_SAMPLES)
+        preds = np.asarray(preds)
         n_flagged = int((preds == -1).sum())
         ml_false_rows += n_flagged
         if n_flagged > 0:

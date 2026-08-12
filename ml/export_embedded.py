@@ -69,6 +69,8 @@ def emit_c_array(name, values, c_type):
 
 
 def generate_header(model, feature_names):
+    # -offset_ under the paper convention; see the comment emitted below.
+    threshold = float(-model.offset_)
     trees = [tree_arrays(est) for est in model.estimators_]
     n_trees = len(trees)
     max_samples = getattr(model, "_max_samples", trees[0]["n_node_samples"][0])
@@ -100,6 +102,20 @@ def generate_header(model, feature_names):
     lines.append(f"#define ANOMALY_MODEL_N_FEATURES {len(feature_names)}")
     lines.append(f"#define ANOMALY_MODEL_N_TREES {n_trees}")
     lines.append(f"static const float ANOMALY_MODEL_C_NORM = {c_norm:.8f}f;")
+    lines.append("")
+    lines.append("/* Decision threshold, converted to THIS file's sign convention.")
+    lines.append(" *")
+    lines.append(" * Without this the header exported a score and no cutoff, so firmware")
+    lines.append(" * could compute a number and had no way to turn it into a decision.")
+    lines.append(" *")
+    lines.append(" * Derivation: sklearn's predict() returns anomalous iff")
+    lines.append(" *     decision_function = score_samples - offset_ < 0")
+    lines.append(" * and score_samples = -s_paper, so")
+    lines.append(" *     anomalous  <=>  s_paper > -offset_")
+    lines.append(" * offset_ was set at fit time from the contamination hyperparameter; it")
+    lines.append(" * is NOT a calibrated probability cutoff. See the evaluation report.")
+    lines.append(f" */")
+    lines.append(f"static const float ANOMALY_MODEL_THRESHOLD = {threshold:.10f}f;")
     lines.append("")
 
     for i, tr in enumerate(trees):
@@ -157,6 +173,21 @@ def generate_header(model, feature_names):
     lines.append("    }")
     lines.append("    float avg_path_length = total_path_length / (float)ANOMALY_MODEL_N_TREES;")
     lines.append("    return powf(2.0f, -avg_path_length / ANOMALY_MODEL_C_NORM);")
+    lines.append("}")
+    lines.append("")
+    lines.append("")
+    lines.append("/* True if the feature vector should be treated as anomalous.")
+    lines.append(" *")
+    lines.append(" * Defined AFTER isolation_forest_score deliberately -- C requires the")
+    lines.append(" * callee to be declared first, and an earlier revision of this generator")
+    lines.append(" * emitted it above the score function, which would not have compiled.")
+    lines.append(" *")
+    lines.append(" * ADVISORY ONLY. The FDIR port must route this through the same debounced")
+    lines.append(" * latch every deterministic detector uses. FAULT_ML_ANOMALY carries")
+    lines.append(" * neither SAFE-mode authority nor recovery-action authority, and any C")
+    lines.append(" * port that grants it either has broken the architecture. */")
+    lines.append("static int isolation_forest_is_anomalous(const float *x) {")
+    lines.append("    return isolation_forest_score(x) > ANOMALY_MODEL_THRESHOLD;")
     lines.append("}")
     lines.append("")
     lines.append("#endif /* CUBESAT_ANOMALY_MODEL_H */")
