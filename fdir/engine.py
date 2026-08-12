@@ -40,9 +40,12 @@ from typing import Dict, List, Optional, Tuple
 # present, formed an import cycle with simulator/environment.py, and produced two
 # distinct FaultFlag classes at runtime. See icd/__init__.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from icd import FaultFlag, HealthFlag, Mode, Rail, RawSample  # noqa: E402,F401
+from icd import (  # noqa: E402,F401
+    BUS_MEMBERS, Bus, Device, FaultFlag, HealthFlag, Mode, Rail, RawSample,
+)
 
 from . import config as cfg
+from .diagnosis import Cause, Confidence, diagnose
 from .ports import RecoveryAction, RecoveryIntent
 from .recovery import Campaign, CampaignState, VerifyCondition, comms_loss_ladder
 
@@ -81,6 +84,11 @@ RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
 # not cause the spacecraft to switch a rail. That is the project's central
 # principle applied to actions rather than only to modes, and it is enforced
 # here in code with a test that fails if either bit is added.
+# Flags that mean "something is wrong" but which no deterministic rule can
+# turn into a cause. If one of these is set and diagnosis returns UNKNOWN, the
+# spacecraft says so explicitly rather than inventing a label (R10).
+_UNEXPLAINED_FLAGS = FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
+
 RECOVERY_AUTHORITY_FLAGS = (
     FaultFlag.COMMS_LOSS | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
     | FaultFlag.SENSOR_LOCKUP | FaultFlag.SENSOR_TIMEOUT
@@ -140,6 +148,7 @@ class FDIREngine:
         self.voltage_baseline = EwmaStat(cfg.EWMA_ALPHA)
 
         self._imu_history: deque = deque(maxlen=cfg.LOCKUP_WINDOW_SAMPLES)
+        self._suspect_now: set = set()
         self._ml_breach_count = 0
 
         # Consecutive non-breaching observations per fault flag. This is the
@@ -153,6 +162,7 @@ class FDIREngine:
         self.pending_intents: List[RecoveryIntent] = []
         self._comms_loss_since: Optional[float] = None
         self.campaign: Optional[Campaign] = None
+        self.diagnosis = diagnose(FaultFlag.NONE, None)
 
     # ---- lifecycle -------------------------------------------------
 
@@ -205,6 +215,10 @@ class FDIREngine:
                 self.mode = Mode.NOMINAL
                 self._emit(now, "BOOT -> NOMINAL: self-check clean")
 
+        # Order matters: the data-path discriminator must run BEFORE the
+        # per-channel detectors it gates, or they will have already latched on
+        # a reading the path made up.
+        self._update_data_path(sample, now)
         self._update_sensor_timeout(sample, now)
         self._update_undervoltage(sample, now)
         self._update_thermal(sample, now)
@@ -215,6 +229,19 @@ class FDIREngine:
         if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS and self.mode in (Mode.NOMINAL, Mode.TEST):
             self.mode = Mode.SAFE
             self._emit(now, f"-> SAFE: {FaultFlag(self.fault_flags & SAFE_MODE_TRIGGER_FLAGS)!r}")
+
+        # Diagnosis runs AFTER every detector (so it sees the full picture) and
+        # BEFORE recovery proposals (so an action can be justified by a cause
+        # rather than by a raw flag). It is a pure function of the flags.
+        self.diagnosis = diagnose(self.fault_flags, sample)
+        if self.diagnosis.cause == Cause.UNKNOWN and self.fault_flags & _UNEXPLAINED_FLAGS:
+            if not self.fault_flags & FaultFlag.UNKNOWN_ANOMALY:
+                self._emit(now, "UNKNOWN_ANOMALY: something is flagged and no rule "
+                                "identifies a cause -- holding, taking no autonomous action")
+            self.fault_flags |= FaultFlag.UNKNOWN_ANOMALY
+            self._observe(FaultFlag.UNKNOWN_ANOMALY, True)
+        else:
+            self._observe(FaultFlag.UNKNOWN_ANOMALY, False)
 
         self._update_recovery_proposals(now, sample)
 
@@ -257,6 +284,10 @@ class FDIREngine:
             self.fault_flags &= ~FaultFlag.UNDERVOLTAGE_WARNING
 
     def _update_thermal(self, sample: RawSample, now: float) -> None:
+        if not self._channel_trusted(Device.TEMP):
+            self._thermal_since = None
+            self._observe(FaultFlag.THERMAL_ANOMALY, False)
+            return
         out_of_band = not (cfg.THERMAL_CRITICAL_LOW_C <= sample.temp_c <= cfg.THERMAL_CRITICAL_HIGH_C)
         self._observe(FaultFlag.THERMAL_ANOMALY, out_of_band)
         if out_of_band:
@@ -269,6 +300,74 @@ class FDIREngine:
         else:
             self._thermal_since = None
 
+    def _suspect_devices(self, sample: RawSample) -> set:
+        """
+        Which devices are returning something that cannot be a real reading?
+
+        Exact-zero across every axis of a multi-axis sensor is the signature
+        Delfi-C3 documented ("insertion of zero's in the telemetry data"). Real
+        sensor noise makes an exact 0.0 on all three magnetometer axes at once
+        essentially impossible, so this is a cheap, ground-truth-free validity
+        check rather than a simulation shortcut.
+        """
+        suspect = set()
+        if sample.accel_x == 0.0 and sample.accel_y == 0.0 and sample.accel_z == 0.0 \
+                and sample.gyro_x == 0.0 and sample.gyro_y == 0.0 and sample.gyro_z == 0.0:
+            suspect.add(Device.IMU)
+        if sample.mag_x == 0.0 and sample.mag_y == 0.0 and sample.mag_z == 0.0:
+            suspect.add(Device.MAG)
+        if sample.temp_c == 0.0:
+            suspect.add(Device.TEMP)
+        return suspect
+
+    def _update_data_path(self, sample: RawSample, now: float) -> None:
+        """
+        R6, and the only genuine diagnostic ambiguity the failure research found.
+
+        One symptom -- several channels reading nonsense -- has two very
+        different causes: the devices failed, or the path they share did. Two or
+        more devices on the SAME bus going invalid in the same sample is far
+        better explained by one bus fault than by simultaneous independent
+        device failures, so that is what gets latched.
+
+        Shared membership is required, not mere simultaneity: two devices on
+        DIFFERENT buses failing together is not evidence of a path fault, and
+        treating it as one would trade a false sensor diagnosis for a false bus
+        diagnosis.
+        """
+        if self.mode == Mode.BOOT:
+            self._suspect_now = set()
+            return
+        suspect = self._suspect_devices(sample)
+        self._suspect_now = suspect
+
+        path_fault = False
+        for bus, members in BUS_MEMBERS.items():
+            if len(suspect.intersection(members)) >= 2:
+                path_fault = True
+                if not self.fault_flags & FaultFlag.DATA_PATH_SUSPECT:
+                    self._emit(now, f"DATA_PATH_SUSPECT latched: "
+                                    f"{len(suspect.intersection(members))} devices on {bus.name} "
+                                    f"invalid together -- the shared path is the better explanation")
+                self.fault_flags |= FaultFlag.DATA_PATH_SUSPECT
+                break
+        self._observe(FaultFlag.DATA_PATH_SUSPECT, path_fault)
+
+    def _channel_trusted(self, device: Device) -> bool:
+        """
+        Should a per-channel detector act on this device's reading?
+
+        No, if the device is currently suspect AND its bus is under suspicion.
+        This is the gate that stops Delfi-C3 from happening here: a zeroed bus
+        used to latch SENSOR_LOCKUP -- because five identical zero readings look
+        exactly like a frozen sensor -- and SENSOR_LOCKUP carries autonomous
+        SAFE authority, so the spacecraft safed itself over a fault that was not
+        in the IMU at all.
+        """
+        if not self.fault_flags & FaultFlag.DATA_PATH_SUSPECT:
+            return True
+        return device not in getattr(self, "_suspect_now", set())
+
     def _update_lockup(self, sample: RawSample, now: float) -> None:
         # A frozen IMU still ACKs (imu_responded True) but stops changing.
         # Exact-repeat-for-N-samples is a cheap, ground-truth-free detector --
@@ -279,6 +378,13 @@ class FDIREngine:
         # what caused the adaptive-baseline cold-start bug found in V0).
         if self.mode == Mode.BOOT:
             self._imu_history.clear()
+            return
+        if not self._channel_trusted(Device.IMU):
+            # The path carrying this reading is under suspicion, so the reading
+            # is not evidence about the device. Clearing the window prevents a
+            # run of path-generated zeros from ever satisfying the detector.
+            self._imu_history.clear()
+            self._observe(FaultFlag.SENSOR_LOCKUP, False)
             return
         if sample.imu_responded:
             fingerprint = (sample.accel_x, sample.accel_y, sample.accel_z,

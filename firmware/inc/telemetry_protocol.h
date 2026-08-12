@@ -95,7 +95,9 @@ typedef enum {
 #define FAULT_THERMAL_ANOMALY           (1u << 8)   /* FDIR-009 */
 #define FAULT_SENSOR_LOCKUP             (1u << 9)   /* FDIR-010 */
 #define FAULT_RECOVERY_FAILED           (1u << 10)  /* escalation exhausted */
-/* bits 11-31 reserved */
+#define FAULT_DATA_PATH_SUSPECT         (1u << 11)  /* R6: shared bus, not the devices */
+#define FAULT_UNKNOWN_ANOMALY           (1u << 12)  /* R10: no diagnosis matches */
+/* bits 13-31 reserved */
 
 /* ==========================================================================
  * HealthFlag bits (simulator/protocol.py: class HealthFlag(IntFlag))

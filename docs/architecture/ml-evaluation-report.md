@@ -6,7 +6,7 @@ Model: `ml\models\isolation_forest_v1.joblib` -- Isolation Forest, 50 trees, tra
 
 ## Coverage gap (read before the table)
 
-The simulator can now inject **8** fault types, but this report scores only **5**. Unscored: `communication_loss`, `radio_latchup`, `rail_overcurrent`.
+The simulator can now inject **9** fault types, but this report scores only **5**. Unscored: `communication_loss`, `data_bus_failure`, `radio_latchup`, `rail_overcurrent`.
 
 These are unscored because **no detector exists for them yet** -- there is no `FaultFlag` they map to, so there is nothing to measure a deterministic recall against and no honest baseline to compare the model with. They were added to the environment in Phase 2 (physical state) ahead of the detectors that will consume them in later phases. Their episodes are present in the generated dataset and do influence the nominal/anomalous score distributions, but no claim is made about detecting them. Do not read the table below as covering the full fault set.
 

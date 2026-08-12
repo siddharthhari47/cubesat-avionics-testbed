@@ -14,9 +14,10 @@
     "thermal",
     "radio_latchup",
     "rail_overcurrent",
-    "communication_loss"
+    "communication_loss",
+    "data_bus_failure"
   ],
-  "total_episodes": 160,
-  "total_samples": 96000,
-  "generated_at_unix_s_placeholder": 1786467773.4013436
+  "total_episodes": 175,
+  "total_samples": 105000,
+  "generated_at_unix_s_placeholder": 1786528533.5493312
 }

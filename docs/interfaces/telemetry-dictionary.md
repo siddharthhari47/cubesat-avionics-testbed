@@ -74,7 +74,9 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 8 | Thermal anomaly | FDIR-009 |
 | 9 | Sensor lockup (stuck/frozen reading, distinct from timeout) | FDIR-010 |
 | 10 | Recovery campaign exhausted every rung without verification | R3 |
-| 11-31 | Reserved | — |
+| 11 | Data-path suspect: 2+ devices on one bus invalid together | R6 |
+| 12 | Unknown anomaly: no enumerated diagnosis matches | R10 |
+| 13-31 | Reserved | — |
 
 ## Health Flag Bits (offset 13, uint16 bitmask)
 

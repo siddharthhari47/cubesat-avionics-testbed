@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from icd import Rail, RawSample, ThermalNode  # noqa: E402
+from icd import Bus, Device, Rail, RawSample, ThermalNode  # noqa: E402
 
 # --- nominal operating point --------------------------------------------------
 # Chosen so the derived values reproduce the pre-Phase-2 constants exactly:
@@ -128,6 +128,7 @@ FAULT_TYPES = (
     "radio_latchup",    # SEL: draw up, unresponsive, hot, comms dead, needs power removal
     "rail_overcurrent",  # a load eats the battery while voltage thresholds stay happy
     "communication_loss",  # link down, everything else healthy
+    "data_bus_failure",    # Delfi-C3: the PATH fails, the devices are fine
 )
 
 
@@ -176,6 +177,12 @@ class SpacecraftEnvironment:
         self.device_responsive: Dict[str, bool] = {
             "imu": True, "temp": True, "mag": True, "radio": True,
         }
+        # Data paths, separate from the devices on them. Delfi-C3's CDHS flaw
+        # "often prevented data transmission on the bus, leading to insertion of
+        # zero's in the telemetry data" -- the sensors themselves were fine. A
+        # simulation that models this by breaking three sensors has built three
+        # sensor faults, not a bus fault, and proves nothing about isolation.
+        self.bus_healthy: Dict[int, bool] = {b: True for b in Bus}
         self.link_healthy = True
         self.last_ground_contact_t = 0.0
 
@@ -203,6 +210,8 @@ class SpacecraftEnvironment:
             self._rail_draw_multiplier[Rail.PAYLOAD] = 30.0
         elif fault_name == "communication_loss":
             self.link_healthy = False
+        elif fault_name == "data_bus_failure":
+            self.bus_healthy[Bus.I2C_A] = False
 
     def clear(self, fault_name: str) -> None:
         """
@@ -224,6 +233,8 @@ class SpacecraftEnvironment:
             self._rail_draw_multiplier[Rail.PAYLOAD] = 1.0
         elif fault_name == "communication_loss":
             self.link_healthy = True
+        elif fault_name == "data_bus_failure":
+            self.bus_healthy[Bus.I2C_A] = True
         elif fault_name == "gradual_drift":
             self.battery_r_internal_ohm = BATTERY_R_NOMINAL_OHM
         elif fault_name == "undervoltage":
@@ -392,13 +403,29 @@ class SpacecraftEnvironment:
         if "thermal" in self._fault_start:
             reported_temp = THERMAL_INJECTED_C + temp_noise
 
+        # Bus corruption: every device on the failed path returns exact zeros
+        # while still ACKing. The devices are healthy; only their shared path
+        # is not. Note what is NOT done here -- device_responsive is untouched,
+        # because a bus that inserts zeros is not the same failure as a device
+        # that stopped answering, and collapsing the two would erase the very
+        # distinction this fault exists to test.
+        mag_reported = (25.0 + mag_noise[0], -8.0 + mag_noise[1], 40.0 + mag_noise[2])
+        if not self.bus_healthy[Bus.I2C_A]:
+            members = {Device.IMU, Device.MAG, Device.TEMP}
+            if Device.IMU in members:
+                imu = {k: 0.0 for k in imu}
+            if Device.MAG in members:
+                mag_reported = (0.0, 0.0, 0.0)
+            if Device.TEMP in members:
+                reported_temp = 0.0
+
         sample = RawSample(
             temp_c=reported_temp,
             accel_x=imu["accel_x"], accel_y=imu["accel_y"], accel_z=imu["accel_z"],
             gyro_x=imu["gyro_x"], gyro_y=imu["gyro_y"], gyro_z=imu["gyro_z"],
-            mag_x=25.0 + mag_noise[0],
-            mag_y=-8.0 + mag_noise[1],
-            mag_z=40.0 + mag_noise[2],
+            mag_x=mag_reported[0],
+            mag_y=mag_reported[1],
+            mag_z=mag_reported[2],
             bus_voltage_v=bus_voltage + v_noise,
             bus_current_a=bus_current + i_noise,
             imu_responded=self.device_responsive["imu"],

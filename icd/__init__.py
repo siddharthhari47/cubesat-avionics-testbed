@@ -33,7 +33,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Dict, Optional
 
-__all__ = ["Mode", "FaultFlag", "HealthFlag", "RawSample", "Rail", "ThermalNode"]
+__all__ = ["Mode", "FaultFlag", "HealthFlag", "RawSample", "Rail", "ThermalNode",
+           "Device", "Bus", "BUS_MEMBERS"]
 
 
 class Rail(IntEnum):
@@ -63,6 +64,42 @@ class ThermalNode(IntEnum):
     RADIO = 1
     OBC = 2
     STRUCTURE = 3
+
+
+class Device(IntEnum):
+    """Addressable sensors/peripherals, distinct from the RAIL that powers them.
+    A device can be healthy while its power rail is fine and its DATA BUS is
+    not -- keeping the two vocabularies separate is what makes that statement
+    expressible at all."""
+
+    IMU = 0
+    MAG = 1
+    TEMP = 2
+    RADIO = 3
+
+
+class Bus(IntEnum):
+    """Shared data paths."""
+
+    I2C_A = 0
+    SPI_B = 1
+
+
+# Which devices sit on which bus. This is spacecraft topology, not simulation
+# detail: the diagnosis layer needs it to tell "three sensors failed at once"
+# from "the one bus they share failed", which is the Delfi-C3 distinction and
+# the only genuine diagnostic ambiguity the failure research turned up.
+BUS_MEMBERS = {
+    Bus.I2C_A: (Device.IMU, Device.MAG, Device.TEMP),
+    Bus.SPI_B: (),
+}
+
+
+def bus_of(device: "Device"):
+    for bus, members in BUS_MEMBERS.items():
+        if device in members:
+            return bus
+    return None
 
 
 class Mode(IntEnum):
@@ -100,6 +137,15 @@ class FaultFlag(IntFlag):
     # the spacecraft holds and waits for the ground. Uses bit 10, which
     # only exists because Phase 1b widened this field past uint16.
     RECOVERY_FAILED = 1 << 10
+    # Two or more devices sharing one bus went invalid together. The bus is
+    # a better explanation than simultaneous independent device failures --
+    # Delfi-C3, where protective responses fired against subsystems that
+    # were themselves fine.
+    DATA_PATH_SUSPECT = 1 << 11
+    # Something is wrong and no enumerated diagnosis matches. The spacecraft
+    # is required to be able to say "I do not know" rather than invent a
+    # cause: 63% of the failure record has no identifiable cause at all.
+    UNKNOWN_ANOMALY = 1 << 12
 
 
 class HealthFlag(IntFlag):

@@ -609,42 +609,61 @@ def test_reset_faults_reports_refusal_rather_than_claiming_success():
     assert sim.engine.fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "D3, KNOWN DEFECT, scheduled for Phase 4. A data-path fault that zeros the "
-        "bus produces a repeating IMU fingerprint, so SENSOR_LOCKUP latches and -- "
-        "because SENSOR_LOCKUP holds autonomous SAFE authority -- safes the vehicle "
-        "for a fault that is not in the IMU. This is the Delfi-C3 misdiagnosis "
-        "reproduced in our own code (case study section 5.2). The fix is R6: every "
-        "per-channel detector must pass a data-path-health discriminator before it "
-        "gets autonomous authority. When Phase 4 lands, this test starts passing and "
-        "strict=True will fail the suite until this marker is removed."
-    ),
-)
 def test_zeroed_data_bus_is_not_misdiagnosed_as_a_frozen_imu():
     """
-    The Delfi-C3 reproduction. TU Delft documented a CDHS flaw causing
-    "insertion of zero's in the telemetry data"; the spacecraft's protective
-    responses then fired against subsystems that were themselves fine.
+    THE DELFI-C3 REPRODUCTION, now fixed (D3, R6).
 
-    Here every IMU channel reads exactly 0.0 while the device still ACKs --
-    the signature of a dead bus, not a dead sensor. The desired behaviour is
-    that this does NOT latch SENSOR_LOCKUP and does NOT command SAFE.
+    TU Delft documented a CDHS flaw causing "insertion of zero's in the
+    telemetry data"; the spacecraft's protective responses then fired against
+    subsystems that were themselves fine. Before Phase 4 this codebase did the
+    same thing: five identical zero readings look exactly like a frozen sensor,
+    SENSOR_LOCKUP latched, and SENSOR_LOCKUP carries autonomous SAFE authority
+    -- so the vehicle safed itself over a fault that was not in the IMU.
+
+    The real signature is every device on the shared bus going invalid at once,
+    which is what this constructs: IMU, magnetometer and temperature all read
+    exact zeros while every device still ACKs.
     """
     engine = FDIREngine()
     now = drive_to_nominal(engine)
 
-    zeroed = dict(accel=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0), imu_responded=True)
+    bus_zeroed = dict(accel=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0),
+                      mag=(0.0, 0.0, 0.0), temp_c=0.0, imu_responded=True)
     for _ in range(cfg.LOCKUP_WINDOW_SAMPLES + 3):
-        engine.tick(make_sample(**zeroed), now)
+        engine.tick(make_sample(**bus_zeroed), now)
         now += 0.05
 
+    assert engine.fault_flags & FaultFlag.DATA_PATH_SUSPECT, (
+        "several devices on one bus invalid together must be diagnosed as the path"
+    )
     assert not (engine.fault_flags & FaultFlag.SENSOR_LOCKUP), (
         "a zeroed data path must not be diagnosed as a frozen IMU"
     )
     assert engine.mode != Mode.SAFE, (
         "a data-path fault must not command SAFE via a per-channel detector"
+    )
+
+
+def test_a_single_zeroed_device_is_still_diagnosed_as_a_device_fault():
+    """
+    The other half of the discrimination pair, and the reason the rule requires
+    TWO devices rather than one. A single sensor returning zeros genuinely IS a
+    device fault -- suppressing per-device diagnosis for it would trade a false
+    sensor diagnosis for a false bus diagnosis, which is no better.
+    """
+    engine = FDIREngine()
+    now = drive_to_nominal(engine)
+
+    only_imu = dict(accel=(0.0, 0.0, 0.0), gyro=(0.0, 0.0, 0.0), imu_responded=True)
+    for _ in range(cfg.LOCKUP_WINDOW_SAMPLES + 3):
+        engine.tick(make_sample(**only_imu), now)
+        now += 0.05
+
+    assert not (engine.fault_flags & FaultFlag.DATA_PATH_SUSPECT), (
+        "one device is not evidence of a shared-path fault"
+    )
+    assert engine.fault_flags & FaultFlag.SENSOR_LOCKUP, (
+        "a genuinely frozen single sensor must still be caught"
     )
 
 
