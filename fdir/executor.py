@@ -92,6 +92,20 @@ class RecoveryExecutor:
             self._in_flight = _PendingCycle(intent=intent, powered_off_at=now, record=record)
             return
 
+        if intent.action in (RecoveryAction.POWER_OFF, RecoveryAction.POWER_ON):
+            # One command, no dwell, no restore. Shedding a load is a state
+            # change that is meant to PERSIST until something reverses it --
+            # unlike a power cycle, whose whole purpose is to come back.
+            on = intent.action == RecoveryAction.POWER_ON
+            ok = self._power.set_enabled(intent.target, on)
+            record.accepted = ok
+            record.completed_at = now
+            record.detail = (f"rail {'powered' if on else 'shed'}" if ok
+                             else f"power {'on' if on else 'off'} command refused by port")
+            self.history.append(record)
+            engine.note_action_completed(now, accepted=ok)
+            return
+
         if intent.action == RecoveryAction.RESET_DEVICE:
             if intent.target < 0:
                 # Whole-spacecraft reset. Deliberately a different code path:

@@ -52,6 +52,16 @@ class RecoveryAction(IntEnum):
 
     NONE = 0
     POWER_CYCLE = 1      # remove power for a bounded interval, then restore
+    # Load shedding (R8). Deliberately SEPARATE from POWER_CYCLE, which always
+    # ends with power restored -- that is what makes it a recovery action. Using
+    # it to shed load was a real defect in the first R8 implementation: the mode
+    # changed, the capability object changed, and the rail came straight back on
+    # after the dwell, so the degradation removed no load at all.
+    #
+    # Still reversible, which is the rule every action in this enum obeys:
+    # POWER_ON is its inverse and an operator reaches it via restore_capability.
+    POWER_OFF = 3
+    POWER_ON = 4
     RESET_DEVICE = 2     # assert a device's reset line without cutting power
 
 

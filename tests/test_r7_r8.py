@@ -24,6 +24,8 @@ from fdir.degraded import (  # noqa: E402
 )
 from fdir.diagnosis import Cause, diagnose  # noqa: E402
 from fdir.engine import FDIREngine  # noqa: E402
+from fdir.executor import RecoveryExecutor  # noqa: E402
+from fdir.ports import RecoveryAction  # noqa: E402
 from icd import FaultFlag, Mode, Rail, RawSample  # noqa: E402
 
 RAILS = {int(Rail.OBC): 0.12, int(Rail.RADIO): 0.10, int(Rail.SENSORS): 0.06,
@@ -299,3 +301,97 @@ def test_rails_to_shed_names_only_the_difference():
     assert set(rails_to_shed(FULL, MINIMAL)) == {int(Rail.SENSORS), int(Rail.ADCS),
                                                  int(Rail.PAYLOAD)}
     assert rails_to_shed(FULL, FULL) == []
+
+
+# ---------------------------------------------------------------------------
+# Two defects found by probing the R8 implementation after writing it
+# ---------------------------------------------------------------------------
+
+def _wired():
+    """Engine + executor + environment, so actions reach simulated hardware."""
+    sys.path.insert(0, str(REPO_ROOT / "simulator"))
+    from environment import SpacecraftEnvironment
+    from hardware_sim import SimulatedPowerPort
+
+    env = SpacecraftEnvironment(seed=9)
+    e = FDIREngine()
+    ex = RecoveryExecutor(SimulatedPowerPort(env), None)
+    for _ in range(60):
+        smp, _t = env.step(0.1)
+        e.tick(smp, env.t)
+        ex.step(e, env.t)
+    return env, e, ex
+
+
+def _spin(env, e, ex, n):
+    for _ in range(n):
+        smp, _t = env.step(0.1)
+        e.tick(smp, env.t)
+        ex.step(e, env.t)
+
+
+def test_shedding_actually_removes_power():
+    """
+    The first R8 implementation issued POWER_CYCLE to shed a rail. A power
+    cycle ALWAYS restores power after its dwell -- that is what makes it a
+    recovery action -- so the mode changed, the capability object changed, and
+    the rail came straight back on. The degradation shed nothing.
+    """
+    env, e, ex = _wired()
+    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+    _spin(env, e, ex, 20)
+
+    assert e.capability is REDUCED
+    assert env.rail_powered[Rail.PAYLOAD] is False, (
+        "a degraded mode that leaves the shed rail powered has not degraded anything"
+    )
+    assert env.rail_powered[Rail.OBC] is True
+    assert env.rail_powered[Rail.RADIO] is True
+    assert all(r.intent.action != RecoveryAction.POWER_CYCLE
+               for r in ex.history), "shedding must not use POWER_CYCLE"
+
+
+def test_capability_survives_a_reboot():
+    """
+    A fresh engine starts at FULL while the rails are still physically shed, so
+    software and hardware disagree about what is powered -- the same class of
+    defect the R7 reference persistence exists to prevent, in a second place.
+    """
+    env, e, ex = _wired()
+    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+    _spin(env, e, ex, 20)
+    saved = e.export_capability_state()
+
+    env.obc_reset()
+    fresh = FDIREngine()
+    fresh.watchdog_reset(env.t)
+    fresh.import_capability_state(saved, env.t)
+
+    assert fresh.capability is REDUCED
+    assert fresh.mode == Mode.DEGRADED
+    assert env.rail_powered[Rail.PAYLOAD] is False
+
+
+def test_restoring_capability_re_powers_the_shed_rails():
+    """Reversibility is the rule every action in RecoveryAction obeys."""
+    env, e, ex = _wired()
+    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+    _spin(env, e, ex, 20)
+    assert env.rail_powered[Rail.PAYLOAD] is False
+
+    e.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
+    assert e.restore_capability(env.t) is True
+    _spin(env, e, ex, 10)
+    assert env.rail_powered[Rail.PAYLOAD] is True
+    assert e.capability is FULL
+
+
+@pytest.mark.parametrize("bad", [
+    {}, {"schema_version": 2, "level": 1}, {"schema_version": 1},
+    {"schema_version": 1, "level": 99}, {"schema_version": 1, "level": -1},
+    {"schema_version": 1, "level": "one"},
+])
+def test_corrupt_capability_state_is_discarded(bad):
+    e = FDIREngine()
+    e.import_capability_state(bad, 0.0)
+    assert e.capability is FULL

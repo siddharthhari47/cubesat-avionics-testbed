@@ -636,6 +636,34 @@ class FDIREngine:
                                 f"reference (limit {cfg.DRIFT_FROM_REFERENCE_V} V)")
             self.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
 
+    def export_capability_state(self) -> dict:
+        """
+        Which capability set is in force, for NVM.
+
+        Found by probing a reboot: a fresh engine starts at FULL while the rails
+        stay physically shed, so software and hardware disagree about what is
+        powered. Exactly the class of defect the R7 reference persistence exists
+        to prevent, in a second place.
+        """
+        return {"schema_version": 1, "level": self.capability.level}
+
+    def import_capability_state(self, state: Optional[dict], now: float) -> None:
+        if not state:
+            return
+        try:
+            if state.get("schema_version") != 1:
+                raise ValueError(f"unsupported capability schema {state.get('schema_version')!r}")
+            level = int(state["level"])
+            if not 0 <= level < len(LADDER):
+                raise ValueError(f"level {level} outside the ladder")
+        except (KeyError, TypeError, ValueError) as exc:
+            self._emit(now, f"capability state discarded (unreadable: {exc})")
+            return
+        self.capability = set_for_level(level)
+        if level > 0:
+            self.mode = Mode.DEGRADED
+        self._emit(now, f"capability restored after reset: {self.capability.name}")
+
     def export_reference_state(self) -> Optional[dict]:
         """Commissioning reference, for NVM. Written once, then never again."""
         if self.voltage_reference is None:
@@ -684,7 +712,11 @@ class FDIREngine:
         shed = rails_to_shed(self.capability, target)
         for rail in shed:
             self.pending_intents.append(RecoveryIntent(
-                action=RecoveryAction.POWER_CYCLE, target=Rail(rail),
+                # POWER_OFF, not POWER_CYCLE. A power cycle always restores
+                # power after its dwell -- using it here meant the mode changed,
+                # the capability object changed, and the rail came straight back
+                # on, so the degradation shed nothing. Measured, not theorised.
+                action=RecoveryAction.POWER_OFF, target=Rail(rail),
                 reason=f"degrade to {target.name}: shedding {Rail(rail).name}",
                 requested_at=now,
             ))
@@ -709,6 +741,12 @@ class FDIREngine:
         if select_level(self.fault_flags) > 0:
             return False
         previous = self.capability
+        for rail in rails_to_shed(LADDER[0], previous):
+            self.pending_intents.append(RecoveryIntent(
+                action=RecoveryAction.POWER_ON, target=Rail(rail),
+                reason=f"restore {previous.name} -> FULL: re-powering {Rail(rail).name}",
+                requested_at=now,
+            ))
         self.capability = LADDER[0]
         if self.mode == Mode.DEGRADED:
             self.mode = Mode.NOMINAL
