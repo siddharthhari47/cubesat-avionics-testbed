@@ -103,7 +103,14 @@ class RecoveryExecutor:
             record.detail = (f"rail {'powered' if on else 'shed'}" if ok
                              else f"power {'on' if on else 'off'} command refused by port")
             self.history.append(record)
-            engine.note_action_completed(now, accepted=ok)
+            # Load shedding reports to the CAPABILITY state machine, not the
+            # recovery campaign -- they are different decisions with different
+            # bookkeeping, and routing a shed through note_action_completed
+            # would advance a campaign that never issued it.
+            if intent.action == RecoveryAction.POWER_OFF:
+                engine.note_shed_completed(now, intent.target, ok)
+            else:
+                engine.note_action_completed(now, accepted=ok)
             return
 
         if intent.action == RecoveryAction.RESET_DEVICE:

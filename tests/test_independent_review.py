@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from fdir import config as cfg  # noqa: E402
 from fdir.diagnosis import Cause, diagnose  # noqa: E402
 from fdir.engine import FDIREngine  # noqa: E402
+from fdir.executor import RecoveryExecutor  # noqa: E402
 from icd import FaultFlag, HealthFlag, Mode, Rail, RawSample  # noqa: E402
 
 RAILS = {int(Rail.OBC): 0.12, int(Rail.RADIO): 0.10, int(Rail.SENSORS): 0.06,
@@ -107,16 +108,37 @@ def test_a_bad_reference_is_escapable():
     A latching detector whose reference can be wrong needs a way to correct the
     reference, or it is a trap rather than a detector.
     """
+    class AcceptingPort:
+        def set_enabled(self, dev, on):
+            return True
+
+        def is_enabled(self, dev):
+            return True
+
     e, t = nominal(25)
+    ex = RecoveryExecutor(AcceptingPort(), None)
     e.voltage_reference = 4.24                      # as if captured badly
-    t = drive(e, t, 80)                             # perfectly nominal telemetry
+    for i in range(80):                             # perfectly nominal telemetry
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
+
     assert e.fault_flags & FaultFlag.DRIFT_FROM_REFERENCE
-    assert e.capability.level > 0
-    assert e.reset_faults(t)[0] == FaultFlag.NONE
-    assert e.restore_capability(t) is False
+    assert e.capability.level > 0, "the vehicle degraded over a measurement error"
+    assert e.reset_faults(t)[0] == FaultFlag.NONE, (
+        "the flag cannot clear -- the condition really IS breaching against a "
+        "reference that is itself wrong"
+    )
+    assert e.restore_capability(t) is False, "and so capability cannot be restored"
+
+    # Without recommission_reference() the two assertions above are the end of
+    # the story, for the rest of the mission.
 
     e.recommission_reference(t)
-    t = drive(e, t, 40)
+    for i in range(40):
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
     assert not (e.fault_flags & FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.voltage_reference == pytest.approx(5.0, abs=0.05)
     assert e.restore_capability(t) is True

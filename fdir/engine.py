@@ -216,8 +216,12 @@ class FDIREngine:
         self.voltage_reference: Optional[float] = None
         self._reference_samples: List[float] = []
         self._drift_since: Optional[float] = None
-        # R8. Which capability set the vehicle is currently operating.
+        # R8. Which capability set the vehicle is CONFIRMED to be operating --
+        # advanced only once the executor reports the sheds succeeded.
         self.capability: CapabilitySet = LADDER[0]
+        self._capability_target: Optional[CapabilitySet] = None
+        self._shed_pending: set = set()
+        self._degrade_attempts = 0
         # Which rails are currently over their ceiling. Read by diagnose() to
         # name the offender rather than reporting a bare "something is hot".
         self.overcurrent_rails: set = set()
@@ -640,7 +644,14 @@ class FDIREngine:
             # to admit exactly the samples it was written to exclude.
             if sample.bus_voltage_v < cfg.UNDERVOLTAGE_WARNING_V:
                 return
-            if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS:
+            # ANY ongoing condition, not just the SAFE-commanding ones. A
+            # RAIL_OVERCURRENT perturbs bus voltage through I*R without
+            # tripping a voltage threshold or commanding SAFE, so the old guard
+            # let a reference be captured at 5.0 V while a rail was drawing 30x
+            # nominal -- baking the fault into the number every future
+            # measurement is compared against. THERMAL was blocked only by
+            # accident, because it happens to carry SAFE authority.
+            if self.fault_flags & CONDITION_BACKED_FLAGS:
                 return
             self._reference_samples.append(sample.bus_voltage_v)
             if len(self._reference_samples) >= cfg.REFERENCE_CAPTURE_SAMPLES:
@@ -761,6 +772,11 @@ class FDIREngine:
         """
         if self.mode in (Mode.BOOT, Mode.SAFE):
             return
+        if self._shed_pending:
+            return              # a downgrade is already in flight
+        if (self._capability_target is not None
+                and self._degrade_attempts >= cfg.MAX_DEGRADE_ATTEMPTS):
+            return              # bounded, like every other autonomous action
         # Mode must follow capability even when no flag currently argues for a
         # downgrade. After a reset the capability is restored from NVM while the
         # flags that caused it are gone, so the vehicle sat at REDUCED and
@@ -786,11 +802,20 @@ class FDIREngine:
                 reason=f"degrade to {target.name}: shedding {Rail(rail).name}",
                 requested_at=now,
             ))
-        previous = self.capability
-        self.capability = target
-        if self.mode != Mode.DEGRADED:
-            self.mode = Mode.DEGRADED
-        self._emit(now, f"-> DEGRADED [{previous.name} -> {target.name}]: "
+        # Capability is NOT advanced here. The engine proposes; the executor
+        # acts; and until the executor reports success the rail is still
+        # powered. Committing optimistically made the engine believe PAYLOAD was
+        # shed while a refusing port left it on -- software and hardware
+        # disagreeing about the physical configuration, which is the same class
+        # of defect as the capability that did not survive a reboot.
+        #
+        # It is also the KySat-2 principle applied consistently: recovery
+        # campaigns already refuse to treat an issued command as an achieved
+        # outcome. Degradation had been exempt from its own architecture's rule.
+        self._capability_target = target
+        self._shed_pending = set(shed)
+        self._degrade_attempts += 1
+        self._emit(now, f"degrading [{self.capability.name} -> {target.name}]: "
                         f"shedding {[Rail(r).name for r in shed]}; "
                         f"loses {target.loses}")
 
@@ -1113,6 +1138,39 @@ class FDIREngine:
         self.fault_flags |= FaultFlag.RECOVERY_FAILED
         self._emit(now, f"RECOVERY_FAILED: every rung exhausted after "
                         f"{c.total_attempts} attempt(s); autonomy standing down")
+
+    def note_shed_completed(self, now: float, rail: int, accepted: bool) -> None:
+        """
+        The executor reporting whether a load-shed command was accepted.
+
+        Capability advances here and nowhere else. A refused shed means the rail
+        is still powered, so claiming the degraded configuration would be
+        claiming a physical state that does not exist.
+        """
+        if not self._shed_pending or self._capability_target is None:
+            return
+        if not accepted:
+            self._shed_pending.clear()
+            self._emit(now, f"degrade to {self._capability_target.name} FAILED: "
+                            f"port refused to shed {Rail(rail).name}; capability "
+                            f"remains {self.capability.name} "
+                            f"(attempt {self._degrade_attempts}/{cfg.MAX_DEGRADE_ATTEMPTS})")
+            if self._degrade_attempts >= cfg.MAX_DEGRADE_ATTEMPTS:
+                self._emit(now, "degradation standing down; the ground is better "
+                                "placed to decide what to do with a rail that "
+                                "will not switch")
+            return
+        self._shed_pending.discard(int(rail))
+        if self._shed_pending:
+            return
+        previous = self.capability
+        self.capability = self._capability_target
+        self._capability_target = None
+        self._degrade_attempts = 0
+        if self.mode == Mode.NOMINAL:
+            self.mode = Mode.DEGRADED
+        self._emit(now, f"-> DEGRADED [{previous.name} -> {self.capability.name}]: "
+                        f"sheds confirmed by the executor")
 
     def note_action_completed(self, now: float, accepted: bool) -> None:
         """

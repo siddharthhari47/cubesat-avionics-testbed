@@ -131,3 +131,10 @@ REFERENCE_CAPTURE_SAMPLES = 20
 # degradation while the fixed thresholds still read healthy.
 DRIFT_FROM_REFERENCE_V = 0.25
 DRIFT_DEBOUNCE_S = 2.0
+
+
+# R8: how many times autonomy may try to reach a degraded configuration before
+# standing down. Bounded for the same reason recovery campaigns are: a rail that
+# will not switch is a hardware fault, and retrying it forever is the KySat-2
+# loop wearing different clothes.
+MAX_DEGRADE_ATTEMPTS = 2

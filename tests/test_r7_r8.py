@@ -53,6 +53,41 @@ def commissioned():
     return e, t
 
 
+class _AcceptingPort:
+    """Minimal PowerPort that accepts everything, for capability tests that are
+    about the decision rather than the hardware."""
+
+    def __init__(self):
+        self.calls = []
+
+    def set_enabled(self, dev, on):
+        self.calls.append((int(dev), on))
+        return True
+
+    def is_enabled(self, dev):
+        return True
+
+
+def degraded_engine(flags):
+    """
+    Drive a downgrade to CONFIRMED completion.
+
+    Capability no longer advances when the intent is issued -- only when the
+    executor reports the shed succeeded. Driving the engine bare therefore
+    leaves it at FULL forever, which is the point: the engine must not claim a
+    physical configuration nothing has achieved.
+    """
+    e, t = commissioned()
+    port = _AcceptingPort()
+    ex = RecoveryExecutor(port, None)
+    e.fault_flags |= flags
+    for i in range(6):
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
+    return e, t, ex, port
+
+
 def drive(e, t, n, **kw):
     for i in range(n):
         e.tick(sample(i, **kw), t)
@@ -229,16 +264,64 @@ def test_corroborating_evidence_degrades_further():
 
 
 def test_the_engine_enters_degraded_and_sheds_the_right_rails():
-    e, t = commissioned()
-    e.take_pending_intents()
-    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
-    e.tick(sample(0), t)
-
+    e, t, ex, port = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.mode == Mode.DEGRADED
     assert e.capability is REDUCED
-    shed = [i.target for i in e.take_pending_intents()]
-    assert Rail.PAYLOAD in shed
-    assert Rail.OBC not in shed and Rail.RADIO not in shed
+    shed = [dev for dev, on in port.calls if not on]
+    assert int(Rail.PAYLOAD) in shed
+    assert int(Rail.OBC) not in shed and int(Rail.RADIO) not in shed
+
+
+def test_capability_is_not_claimed_until_the_executor_confirms():
+    """
+    The engine proposes; the executor acts. Committing the capability when the
+    intent was merely ISSUED meant a refusing port left the engine believing a
+    rail was shed while it was still powered -- software and hardware
+    disagreeing about the physical configuration.
+    """
+    class Refusing:
+        def set_enabled(self, dev, on):
+            return False
+
+        def is_enabled(self, dev):
+            return True
+
+    e, t = commissioned()
+    ex = RecoveryExecutor(Refusing(), None)
+    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+    for i in range(6):
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
+    assert e.capability is FULL, "a refused shed must not advance capability"
+    assert any("FAILED" in m for _, m in e.log)
+
+
+def test_a_refused_downgrade_is_bounded():
+    """A rail that will not switch is a hardware fault; retrying forever is the
+    KySat-2 loop in different clothes."""
+    class Refusing:
+        def __init__(self):
+            self.n = 0
+
+        def set_enabled(self, dev, on):
+            self.n += 1
+            return False
+
+        def is_enabled(self, dev):
+            return True
+
+    port = Refusing()
+    e, t = commissioned()
+    ex = RecoveryExecutor(port, None)
+    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+    for i in range(200):
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
+    assert port.n <= cfg.MAX_DEGRADE_ATTEMPTS, (
+        f"{port.n} shed attempts against a bound of {cfg.MAX_DEGRADE_ATTEMPTS}"
+    )
 
 
 def test_degrading_does_not_upgrade_itself_when_the_flag_clears():
@@ -247,9 +330,7 @@ def test_degrading_does_not_upgrade_itself_when_the_flag_clears():
     downgrade are the ones the vehicle is worst placed to judge resolved, and
     silently restoring payload power is how a spacecraft oscillates.
     """
-    e, t = commissioned()
-    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
-    t = drive(e, t, 2)
+    e, t, _ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.capability is REDUCED
 
     e.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
@@ -258,9 +339,7 @@ def test_degrading_does_not_upgrade_itself_when_the_flag_clears():
 
 
 def test_an_operator_can_restore_capability_once_the_condition_clears():
-    e, t = commissioned()
-    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
-    t = drive(e, t, 2)
+    e, t, _ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.restore_capability(t) is False, "refused while the cause is present"
 
     e.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
@@ -275,9 +354,7 @@ def test_safe_mode_outranks_degraded():
     command SAFE the mission is not currently viable, and shedding payload is
     not the answer to it.
     """
-    e, t = commissioned()
-    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
-    t = drive(e, t, 2)
+    e, t, _ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.mode == Mode.DEGRADED
 
     e.fault_flags |= FaultFlag.THERMAL_ANOMALY
@@ -286,9 +363,7 @@ def test_safe_mode_outranks_degraded():
 
 
 def test_leaving_safe_does_not_silently_restore_capability():
-    e, t = commissioned()
-    e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
-    t = drive(e, t, 2)
+    e, t, _ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     e.enter_safe_mode(t)   # operator command; no SAFE-triggering flag is set
 
     assert e.exit_safe_mode(t) is True
