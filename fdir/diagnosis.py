@@ -50,6 +50,7 @@ class Cause(IntEnum):
     RECOVERY_EXHAUSTED = 8
     RAIL_OVERCURRENT = 9      # a rail is drawing above its ceiling (FDIR-011)
     SENSOR_CORRUPT = 10       # one device, its bus fine, returning nonsense
+    DEGRADATION = 11          # drifted from the commissioning reference (R7)
 
 
 class Confidence(IntEnum):
@@ -181,6 +182,17 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
             Cause.SENSOR_CORRUPT, Confidence.LIKELY,
             "one device is returning physically impossible values while the bus "
             "it shares is healthy, so the device is the better explanation",
+        )
+
+    # R7. Ranked below the acute faults and above UNKNOWN: a drift is real,
+    # deterministic and named, but it is a degradation rather than an emergency,
+    # and anything acute happening at the same time is the better explanation.
+    if fault_flags & FaultFlag.DRIFT_FROM_REFERENCE:
+        return Diagnosis(
+            Cause.DEGRADATION, Confidence.LIKELY,
+            "a channel has moved away from its commissioning reference by more "
+            "than the allowed band; slow enough that an adaptive baseline would "
+            "have absorbed it as the new normal",
         )
 
     if fault_flags & FaultFlag.RECOVERY_FAILED:

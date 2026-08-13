@@ -48,6 +48,7 @@ from icd import (  # noqa: E402,F401
 from . import config as cfg
 from .diagnosis import Cause, Confidence, diagnose
 from .ports import RecoveryAction, RecoveryIntent
+from .degraded import LADDER, CapabilitySet, rails_to_shed, select_level, set_for_level
 from .recovery import Campaign, CampaignState, VerifyCondition, comms_loss_ladder
 
 # Faults allowed to autonomously force NOMINAL/TEST -> SAFE. Deliberately
@@ -84,6 +85,7 @@ CONDITION_BACKED_FLAGS = (
     | FaultFlag.SENSOR_LOCKUP | FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
     | FaultFlag.DATA_PATH_SUSPECT | FaultFlag.UNKNOWN_ANOMALY | FaultFlag.SENSOR_INVALID
     | FaultFlag.SENSOR_IMPLAUSIBLE | FaultFlag.RAIL_OVERCURRENT
+    | FaultFlag.DRIFT_FROM_REFERENCE
 )
 
 # Flags recording that something happened, not that something is wrong.
@@ -209,6 +211,13 @@ class FDIREngine:
         self._invalid_now: set = set()
         self._implausible_count = 0
         self._overcurrent_since: Optional[float] = None
+        # R7. Captured ONCE at commissioning and persisted; see
+        # _update_reference_drift for why it must not be recaptured on boot.
+        self.voltage_reference: Optional[float] = None
+        self._reference_samples: List[float] = []
+        self._drift_since: Optional[float] = None
+        # R8. Which capability set the vehicle is currently operating.
+        self.capability: CapabilitySet = LADDER[0]
         # Which rails are currently over their ceiling. Read by diagnose() to
         # name the offender rather than reporting a bare "something is hot".
         self.overcurrent_rails: set = set()
@@ -295,6 +304,7 @@ class FDIREngine:
         # been ruled out as the explanation.
         self._update_plausibility(sample, now)
         self._update_rail_overcurrent(sample, now)
+        self._update_reference_drift(sample, now)
         self._update_sensor_timeout(sample, now)
         self._update_undervoltage(sample, now)
         self._update_thermal(sample, now)
@@ -302,9 +312,16 @@ class FDIREngine:
         self._update_adaptive_baseline(sample, now)
         self._update_ml_advisory(ml_advisory, now)
 
-        if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS and self.mode in (Mode.NOMINAL, Mode.TEST):
+        if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS and self.mode in (
+                Mode.NOMINAL, Mode.TEST, Mode.DEGRADED):
             self.mode = Mode.SAFE
             self._emit(now, f"-> SAFE: {FaultFlag(self.fault_flags & SAFE_MODE_TRIGGER_FLAGS)!r}")
+
+        # R8, AFTER the SAFE decision and never instead of it. Degradation is
+        # for preserving a mission that is still viable; if something can
+        # command SAFE then the mission is not currently viable and shedding
+        # payload is not the right answer.
+        self._update_degraded_mode(now)
 
         # Diagnosis runs AFTER every detector (so it sees the full picture) and
         # BEFORE recovery proposals (so an action can be justified by a cause
@@ -570,6 +587,134 @@ class FDIREngine:
                 self._emit(now, f"RAIL_OVERCURRENT latched ({detail}; ceiling "
                                 f"{cfg.RAIL_NOMINAL_CURRENT_CEILING_A} A)")
             self.fault_flags |= FaultFlag.RAIL_OVERCURRENT
+
+    def _update_reference_drift(self, sample: RawSample, now: float) -> None:
+        """
+        R7. Drift measured against a FIXED reference, not a learned one.
+
+        The adaptive baseline (FDIR-006) cannot do this and never could: it
+        follows the signal, so a slow enough change is absorbed as the new
+        normal and the detector reports healthy the whole way down. That is the
+        QuakeSat shape, and this project measured the same blind spot in its own
+        ML evaluation -- 0% recall on gradual_drift.
+
+        A fixed reference cannot be talked into moving. The cost is that it has
+        to be EARNED once, at commissioning, and then PERSISTED: recapturing on
+        every boot would let a reboot part-way through a drift adopt the drifted
+        value as normal, which is D2's defect wearing a different hat. So the
+        reference is exported to NVM alongside campaign state and restored on
+        boot, and start_boot() deliberately does not clear it.
+        """
+        if self.mode == Mode.BOOT or not sample.power_valid:
+            return
+        if self.voltage_reference is None:
+            # Commissioning. Only clean samples contribute -- a reference
+            # captured while something is already wrong is worse than none.
+            if self.fault_flags & (SAFE_MODE_TRIGGER_FLAGS | FaultFlag.UNDERVOLTAGE_WARNING):
+                return
+            self._reference_samples.append(sample.bus_voltage_v)
+            if len(self._reference_samples) >= cfg.REFERENCE_CAPTURE_SAMPLES:
+                self.voltage_reference = sum(self._reference_samples) / len(self._reference_samples)
+                self._emit(now, f"commissioning reference captured: bus voltage "
+                                f"{self.voltage_reference:.3f} V over "
+                                f"{len(self._reference_samples)} samples")
+            return
+
+        deviation = abs(sample.bus_voltage_v - self.voltage_reference)
+        breaching = deviation > cfg.DRIFT_FROM_REFERENCE_V
+        self._observe(FaultFlag.DRIFT_FROM_REFERENCE, breaching)
+        if not breaching:
+            self._drift_since = None
+            return
+        if self._drift_since is None:
+            self._drift_since = now
+        elif now - self._drift_since >= cfg.DRIFT_DEBOUNCE_S:
+            if not self.fault_flags & FaultFlag.DRIFT_FROM_REFERENCE:
+                self._emit(now, f"DRIFT_FROM_REFERENCE latched: bus voltage "
+                                f"{sample.bus_voltage_v:.3f} V is {deviation:.3f} V "
+                                f"from the {self.voltage_reference:.3f} V commissioning "
+                                f"reference (limit {cfg.DRIFT_FROM_REFERENCE_V} V)")
+            self.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE
+
+    def export_reference_state(self) -> Optional[dict]:
+        """Commissioning reference, for NVM. Written once, then never again."""
+        if self.voltage_reference is None:
+            return None
+        return {"schema_version": 1, "voltage_reference": self.voltage_reference}
+
+    def import_reference_state(self, state: Optional[dict], now: float) -> None:
+        """
+        Restore the commissioning reference across a reset.
+
+        Without this, R7 would be defeated by the very thing it guards against:
+        reboot mid-drift, recapture at the drifted value, report healthy.
+        """
+        if not state:
+            return
+        try:
+            if state.get("schema_version") != 1:
+                raise ValueError(f"unsupported reference schema {state.get('schema_version')!r}")
+            value = float(state["voltage_reference"])
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite reference {value!r}")
+        except (KeyError, TypeError, ValueError) as exc:
+            self._emit(now, f"commissioning reference discarded (unreadable: {exc})")
+            return
+        self.voltage_reference = value
+        self._reference_samples = []
+        self._emit(now, f"commissioning reference restored: {value:.3f} V")
+
+    def _update_degraded_mode(self, now: float) -> None:
+        """
+        R8. Select the most capable configuration the evidence still supports.
+
+        Downgrades autonomously; does NOT upgrade autonomously. That asymmetry
+        is deliberate and is the same reasoning as SAFE-mode exit (R9): the
+        conditions that forced a downgrade are the ones the vehicle is worst
+        placed to judge as resolved, and quietly restoring payload power
+        because a flag happened to clear is how a spacecraft oscillates. An
+        operator restores capability, via restore_capability().
+        """
+        if self.mode in (Mode.BOOT, Mode.SAFE):
+            return
+        want = select_level(self.fault_flags)
+        if want <= self.capability.level:
+            return
+        target = set_for_level(want)
+        shed = rails_to_shed(self.capability, target)
+        for rail in shed:
+            self.pending_intents.append(RecoveryIntent(
+                action=RecoveryAction.POWER_CYCLE, target=Rail(rail),
+                reason=f"degrade to {target.name}: shedding {Rail(rail).name}",
+                requested_at=now,
+            ))
+        previous = self.capability
+        self.capability = target
+        if self.mode != Mode.DEGRADED:
+            self.mode = Mode.DEGRADED
+        self._emit(now, f"-> DEGRADED [{previous.name} -> {target.name}]: "
+                        f"shedding {[Rail(r).name for r in shed]}; "
+                        f"loses {target.loses}")
+
+    def restore_capability(self, now: float) -> bool:
+        """
+        Operator command: return to full capability.
+
+        Refused while the conditions that caused the downgrade are still
+        present -- the same evidence discipline exit_safe_mode() applies, for
+        the same reason. Returns True if accepted.
+        """
+        if self.capability.level == 0:
+            return True
+        if select_level(self.fault_flags) > 0:
+            return False
+        previous = self.capability
+        self.capability = LADDER[0]
+        if self.mode == Mode.DEGRADED:
+            self.mode = Mode.NOMINAL
+        self._emit(now, f"capability restored by operator command "
+                        f"({previous.name} -> {self.capability.name})")
+        return True
 
     def _channel_trusted(self, device: Device) -> bool:
         """
@@ -1002,8 +1147,11 @@ class FDIREngine:
             return True
         if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS:
             return False
-        self.mode = Mode.NOMINAL
-        self._emit(now, "SAFE -> NOMINAL by operator command (triggering fault cleared)")
+        # Land in DEGRADED rather than NOMINAL if capability is still shed --
+        # leaving SAFE does not silently restore payload power.
+        self.mode = Mode.DEGRADED if self.capability.level > 0 else Mode.NOMINAL
+        self._emit(now, f"SAFE -> {self.mode.name} by operator command "
+                        f"(triggering fault cleared)")
         return True
 
     def reset_faults(self, now: float) -> Tuple[FaultFlag, FaultFlag]:

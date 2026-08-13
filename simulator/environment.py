@@ -102,6 +102,19 @@ THERMAL_TAU_S = 45.0
 # undervoltage: a battery open-circuit collapse, not a voltage override.
 #   5.06 - 1.20 - 0.40*0.15 = 3.80 V, matching the old injected constant.
 UNDERVOLTAGE_V_OC_SAG = 1.20
+
+# R10. A perturbation deliberately sized to be MEASURABLE AND UNEXPLAINABLE:
+# large enough that the adaptive baseline flags it (many sigma against the tight
+# variance learned from quiet data), small enough that it breaches nothing --
+# 0.15 V leaves the bus at ~4.85 V, above the 4.5 V warning, and inside the
+# 0.25 V commissioning-reference band so R7 stays quiet too.
+#
+# The point is not the number. It is that 63% of the NASA failure record has no
+# identifiable technical cause, and a suite where every injected fault is
+# diagnosable is not testing the largest category in the record at all. This
+# scenario exists to drive the path where the honest answer is "something is
+# wrong and I cannot tell you what".
+UNEXPLAINED_V_OC_SAG = 0.15
 UNDERVOLTAGE_INJECTED_V = 3.80   # retained name; now a derived expectation
 
 # gradual_drift: rising battery internal resistance -- real battery degradation.
@@ -136,6 +149,8 @@ FAULT_TYPES = (
     "radio_unresponsive",
     # The single-device partner to data_bus_failure.
     "sensor_corruption",
+    # R10: measurable, and defeats every enumerated diagnostic rule.
+    "unexplained_transient",
 )
 
 
@@ -228,6 +243,8 @@ class SpacecraftEnvironment:
             self.link_healthy = False
         elif fault_name == "sensor_corruption":
             self.mag_corrupt = True
+        elif fault_name == "unexplained_transient":
+            self._v_oc_sag = UNEXPLAINED_V_OC_SAG
 
     def clear(self, fault_name: str) -> None:
         """
@@ -256,6 +273,8 @@ class SpacecraftEnvironment:
             self.link_healthy = True
         elif fault_name == "sensor_corruption":
             self.mag_corrupt = False
+        elif fault_name == "unexplained_transient":
+            self._v_oc_sag = 0.0
         elif fault_name == "gradual_drift":
             self.battery_r_internal_ohm = BATTERY_R_NOMINAL_OHM
         elif fault_name == "undervoltage":

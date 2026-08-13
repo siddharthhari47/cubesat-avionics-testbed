@@ -180,7 +180,14 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
             r.recovery_latency_s = round(h.env.t - injected_at, 3)
     r.final_mode = Mode(h.engine.mode).name
 
-    if sc.expect_cause is not None and r.diagnosis is not None:
+    if sc.expect_cause is Cause.UNKNOWN:
+        # "Correct" here means the spacecraft never talked itself into a named
+        # cause. r.diagnosis only ever records a KNOWN diagnosis, so absence is
+        # the success condition -- and the suite could not express this at all
+        # until R10 got a scenario, which is why the gap survived so long.
+        r.diagnosis_correct = r.diagnosis is None
+        r.diagnosis = r.diagnosis or "UNKNOWN (held)"
+    elif sc.expect_cause is not None and r.diagnosis is not None:
         r.diagnosis_correct = (r.diagnosis == sc.expect_cause.name)
     elif sc.expect_cause is not None:
         r.diagnosis_correct = False
@@ -209,7 +216,8 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
         # about the FINAL state. Same latching-flag-read-as-live-state mistake
         # the safety review kept turning up.
         r.outcome = Outcome.UNKNOWN_HELD
-    elif h.engine.fault_flags & FaultFlag.RECOVERY_FAILED or h.engine.mode == Mode.SAFE:
+    elif (h.engine.fault_flags & FaultFlag.RECOVERY_FAILED
+          or h.engine.mode in (Mode.SAFE, Mode.DEGRADED)):
         r.outcome = Outcome.CONTAINED
     else:
         r.outcome = Outcome.DETECTED_ONLY
@@ -317,9 +325,41 @@ def build_suite() -> List[Scenario]:
                  expect_cause=Cause.SENSOR_NOT_RESPONDING, seed=52, duration_s=60.0),
 
         # -- the one that must NOT produce a confident answer ---------------
-        Scenario("gradual drift (no fixed threshold breached)", "gradual_drift",
-                 expect_flags=0, seed=61, duration_s=120.0,
-                 note="EWMA absorbs slow drift; measured at 0% recall -- reported, not hidden"),
+        # R7. This scenario spent every previous phase as the honest UNDETECTED
+        # row: the EWMA baseline follows the signal, so a slow enough drift is
+        # absorbed as the new normal (measured at 0% recall in the ML
+        # evaluation, and the flight analogue is QuakeSat). No fixed VOLTAGE
+        # threshold is breached either -- this drift ends at 4.30 V, under the
+        # 4.5 V warning but never reaching the 4.0 V critical.
+        #
+        # The fixed commissioning reference is what closes it, and the forbid is
+        # the meaningful half: catching this via UNDERVOLTAGE_CRITICAL would
+        # mean not catching it at all, since the drift never gets there.
+        Scenario("gradual drift", "gradual_drift",
+                 expect_flags=int(FaultFlag.DRIFT_FROM_REFERENCE),
+                 expect_cause=Cause.DEGRADATION,
+                 forbid_flags=int(FaultFlag.UNDERVOLTAGE_CRITICAL),
+                 seed=61, duration_s=120.0,
+                 note="R7: caught against a FIXED reference the baseline cannot learn away"),
+
+        # -- R10: the largest category in the failure record ------------------
+        # 63% of NASA-catalogued CubeSat failures have no stated technical
+        # cause. Until now every scenario here injected something the rule set
+        # could name, so unknown_held was 0/14 and the R10 path was unit-tested
+        # but never exercised end to end -- the most consequential gap in the
+        # traceability doc.
+        #
+        # The assertion that matters is the FORBID: when the spacecraft cannot
+        # explain what it sees, it must take no autonomous action at all. An
+        # invented diagnosis authorising a wrong action is the Delfi-C3 failure.
+        Scenario("unexplained transient", "unexplained_transient",
+                 expect_flags=int(FaultFlag.ADAPTIVE_ANOMALY),
+                 expect_cause=Cause.UNKNOWN,
+                 forbid_flags=int(FaultFlag.UNDERVOLTAGE_CRITICAL
+                                  | FaultFlag.DRIFT_FROM_REFERENCE
+                                  | FaultFlag.RAIL_OVERCURRENT),
+                 seed=71, duration_s=90.0,
+                 note="R10: measurable, unexplainable, and correctly acted on by NOT acting"),
     ]
 
 

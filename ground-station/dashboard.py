@@ -51,6 +51,7 @@ MODE_COLOR = {
     proto.Mode.NOMINAL: "green",
     proto.Mode.SAFE: "red",
     proto.Mode.TEST: "blue",
+    proto.Mode.DEGRADED: "orange",
 }
 
 
@@ -76,8 +77,11 @@ def live_dashboard():
     try:
         mode = proto.Mode(latest.mode)
         mode_label, mode_colour = mode.name, MODE_COLOR[mode]
-    except ValueError:
-        mode_label, mode_colour = f"UNKNOWN ({latest.mode})", "orange"
+    except (ValueError, KeyError):
+        # KeyError matters as much as ValueError: a mode that is VALID but
+        # missing from MODE_COLOR would crash just as hard, which is what
+        # adding Mode.DEGRADED would have done.
+        mode_label, mode_colour = f"UNKNOWN ({latest.mode})", "gray"
     active_faults = [f.name for f in proto.FaultFlag if f != proto.FaultFlag.NONE and latest.fault_flags & f]
     unhealthy = [h.name for h in proto.HealthFlag if h not in (proto.HealthFlag.NONE, proto.HealthFlag.ALL_OK) and not (latest.health_flags & h)]
 

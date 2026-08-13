@@ -25,20 +25,21 @@ understand well enough to model, what does the architecture actually do about it
 | Scenario | Detected | Latency (s) | Diagnosis | Correct | Outcome | Actions |
 |---|---|---|---|---|---|---|
 | nominal control | no | — | — | — | **clean** | 0 |
-| radio latch-up *(per-rail sensing)* | yes | **0.70** | `RADIO_LATCHUP` | ✅ | recovered | 2 |
+| radio latch-up *(per-rail sensing)* | yes | **0.70** | `RADIO_LATCHUP` | ✅ | recovered | 3 |
 | radio unresponsive *(per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
 | radio latch-up *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ❌ | recovered | 2 |
 | radio unresponsive *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
 | data bus failure | yes | 0.10 | `DATA_PATH` | ✅ | detected_only | 0 |
 | single sensor corrupt | yes | **0.50** | `SENSOR_CORRUPT` | ✅ | detected_only | 0 |
-| recovery that cannot succeed | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 4 |
-| OBC reset mid-recovery | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 8 |
-| rail overcurrent | yes | **0.70** | `RAIL_OVERCURRENT` | ✅ | contained | 0 |
+| recovery that cannot succeed | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 5 |
+| OBC reset mid-recovery | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 10 |
+| rail overcurrent | yes | **0.70** | `RAIL_OVERCURRENT` | ✅ | contained | 1 |
 | undervoltage | yes | 0.30 | `POWER_UNDERVOLTAGE` | ✅ | contained | 0 |
 | thermal excursion | yes | 0.40 | `THERMAL` | ✅ | contained | 0 |
 | sensor frozen | yes | 0.50 | `SENSOR_FROZEN` | ✅ | contained | 0 |
 | sensor not responding | yes | 0.20 | `SENSOR_NOT_RESPONDING` | ✅ | detected_only | 0 |
-| gradual drift | **no** | — | — | — | undetected | 0 |
+| gradual drift | yes | **13.60** | `DEGRADATION` | ✅ | contained | 1 |
+| unexplained transient | yes | **0.30** | *UNKNOWN (held)* | ✅ | **unknown_held** | 0 |
 
 **Correction, 2026-08-12.** Every comms-driven latency above was previously
 recorded as **0.10 s** and is now **5.10 s**. The old figure was wrong, and
@@ -88,8 +89,14 @@ action fired. This matters more than the positive column — four of five
 documented FDIR failures were wrong-action failures, and a suite with only
 positive assertions cannot catch those.
 
-**Outcome distribution (n=14 injected faults):** recovered 2, contained 8,
-detected-only 3, undetected 1, unknown-held 0.
+**Outcome distribution (n=15 injected faults):** recovered 2, contained 9,
+detected-only 3, unknown-held 1, **undetected 0**.
+
+**Every injected fault is now detected and correctly diagnosed.** That is a
+statement about *this fault set*, which we chose and modelled — it says nothing
+about CubeSat failure in general, and the denominator caveat at the top of this
+document applies with full force. A suite that detects everything it was built to
+detect has proved its detectors work, not that the detectors are sufficient.
 
 ---
 

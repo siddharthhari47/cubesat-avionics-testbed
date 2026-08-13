@@ -113,3 +113,21 @@ RAIL_OVERCURRENT_DEBOUNCE_S = 0.5
 # corrupt channel and a frozen one are held to the same standard of evidence --
 # a one-sample glitch is not a failed sensor.
 IMPLAUSIBLE_DEBOUNCE_SAMPLES = 5
+
+# ---- R7: fixed-reference drift detection -----------------------------------
+# The reference is the mean of the first REFERENCE_CAPTURE_SAMPLES nominal
+# readings after commissioning, and it is PERSISTED. Recapturing it on every
+# boot would reintroduce D2's defect in a new place: a reboot part-way through
+# a drift would adopt the drifted value as "normal" and the detector would go
+# quiet exactly when it mattered.
+REFERENCE_CAPTURE_SAMPLES = 20
+
+# Allowed deviation from the commissioning reference before DRIFT_FROM_REFERENCE
+# latches. Bus-voltage noise is sigma = 0.02 V, so 0.25 V is 12.5 sigma -- far
+# outside anything noise produces. Against the modelled battery-resistance drift
+# (5.00 V -> 4.30 V over 30 s) this trips at about 10 s, well before the
+# undervoltage WARNING at 4.5 V and long before CRITICAL, which that drift never
+# reaches at all. That ordering is the point: the fixed reference sees the
+# degradation while the fixed thresholds still read healthy.
+DRIFT_FROM_REFERENCE_V = 0.25
+DRIFT_DEBOUNCE_S = 2.0

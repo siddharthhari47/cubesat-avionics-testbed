@@ -18,12 +18,19 @@ is the missions; the evidence column here is the code and the tests.
 
 | | Count |
 |---|---|
-| Met, verified by test | 8 of 11 |
-| Partially met | 1 (R10) |
-| Not met, deliberately deferred | 2 (R7, R8) |
+| Met, verified by test | **11 of 11** |
+| Met with a stated limitation | 1 (R8 — see below) |
 
-Two requirements are unmet and that is stated plainly rather than softened. Neither
-was forgotten; both are recorded in §5 below with what it would take to close them.
+All eleven are now implemented and test-backed. **R8 carries a limitation that must
+travel with it:** the requirement says degraded modes shall be *pre-validated*, and
+pre-validated means *measured*. Nothing has been measured, because no hardware exists.
+The mechanism, the ladder and the selection logic are built and tested; the power
+budgets are **declared engineering estimates**. `fdir/degraded.py` marks every
+capability set `declared_only=True`, and a test fails if that is quietly flipped
+without updating this document in the same commit.
+
+Read "11 of 11" as *the software is complete against these requirements*, not as
+*validated*. V1 substitutes measurements for estimates.
 
 ---
 
@@ -151,39 +158,70 @@ a dead IMU, which is precisely the Delfi-C3 misdiagnosis. `_suspect_devices()` /
 
 ### R7 — Slow-drift detection must use a fixed reference, not only an adaptive one
 **Evidence in case study:** QuakeSat, plus this project's own measured EWMA blind spot.
-**Status: NOT MET.**
+**Status: MET.**
 
-V0 has adaptive baselines only. A sufficiently slow drift is learned as normal — the
-exact blind spot the case study names. `MIN_ADAPTIVE_SAMPLES` fixes the cold-start
-false positive, which is a different problem and does not address this one.
+A reference is captured at commissioning from clean samples, and drift is measured
+against *that* rather than against a baseline learned in flight. An adaptive baseline
+follows the signal, so a slow enough decline becomes the new normal — measured at 0%
+recall on `gradual_drift` in the ML evaluation. A fixed reference cannot be talked
+into moving.
 
-Partial mitigation exists and should not be mistaken for a fix: the `gradual_drift`
-scenario is detected, but by the *fixed* undervoltage threshold once the drift has
-gone far enough — that is, by a deterministic detector doing its job late, not by
-drift detection. See `docs/architecture/v0-scenario-results.md`.
+- Code: [`fdir/engine.py`](../../fdir/engine.py) `_update_reference_drift()`,
+  `export_reference_state()` / `import_reference_state()`
+- Config: `REFERENCE_CAPTURE_SAMPLES`, `DRIFT_FROM_REFERENCE_V` (0.25 V = 12.5σ
+  against measured 0.02 V noise), `DRIFT_DEBOUNCE_S`
+- Tests: `tests/test_r7_r8.py::test_a_drift_the_adaptive_baseline_absorbs_is_still_caught`,
+  `::test_the_reference_survives_a_reboot`
+- Scenario: `gradual drift` — **detected at 13.60 s, diagnosed `DEGRADATION`**, having
+  spent every prior phase as the suite's honest `undetected` row.
 
-**To close:** a fixed-reference comparator per drifting channel, with the reference
-captured at commissioning rather than learned in flight. Not V0 scope.
+**The persistence half is the load-bearing half.** The reference is written to NVM and
+restored on boot rather than recaptured. Recapturing would let a reboot part-way
+through a drift adopt the drifted value as normal and silence the detector exactly
+when it mattered — D2's defect wearing a different hat. The scenario forbids
+`UNDERVOLTAGE_CRITICAL` because this drift ends at 4.30 V and never reaches the 4.0 V
+threshold: catching it there would mean not catching it.
+
 
 ---
 
 ### R8 — Degraded modes must be pre-validated and autonomously selectable
 **Evidence in case study:** BIRD, Odin, QuakeSat.
-**Status: NOT MET.**
+**Status: MET — mechanism built and tested; capability sets DECLARED, not measured.**
 
-There are four modes (BOOT, NOMINAL, SAFE, TEST) and none of them is degraded. The
-response granularity is still the whole vehicle: the system can run or it can sit in
-SAFE. BIRD's lesson — that graceful degradation preserved the mission — is
-acknowledged and not implemented.
+`Mode.DEGRADED` sits between NOMINAL and SAFE, because a vehicle whose only options
+are "fully working" and "stopped, waiting for the ground" throws away every
+mission-hour a reduced configuration could still have earned. That gap, not the
+absence of a SAFE mode, is BIRD's actual lesson.
 
-Worth stating precisely: BIRD's degradation was *ground-authored*, not autonomous.
-So R8 asks for something no mission in the dataset actually demonstrated
-autonomously. That does not make it wrong, but it does mean implementing it is
-research, not replication.
+- Code: [`fdir/degraded.py`](../../fdir/degraded.py) (`CapabilitySet`, `LADDER`,
+  `select_level`), `FDIREngine._update_degraded_mode()`, `restore_capability()`
+- Tests: `tests/test_r7_r8.py` — 14 covering the ladder, selection and authority
+- Scenario: `gradual drift` now ends `contained` with **1 action** — the payload rail
+  shed autonomously. R7 detects the degradation; R8 responds proportionately.
 
-**To close:** per-rail shed policies with pre-validated capability sets, plus a
-selection rule. Depends on hardware for anything credible, since "pre-validated"
-means measured.
+Three constraints are asserted rather than assumed:
+
+- **The OBC is never shed.** A configuration without the flight computer is not a
+  degraded mode, it is an ending.
+- **The radio survives to the last rung.** CSSWE: the one asset that must survive is
+  the one the ground needs in order to intervene at all.
+- **No advisory flag can cause a downgrade.** Shedding a subsystem changes what the
+  spacecraft can do, so it goes through a named gate exactly like SAFE and recovery.
+  `ADAPTIVE_ANOMALY` and `ML_ANOMALY` appear nowhere in `DEGRADE_TRIGGERS`.
+
+Downgrade is autonomous; **upgrade is not**. The conditions that forced a downgrade
+are the ones the vehicle is worst placed to judge resolved, and silently restoring
+payload power is how a spacecraft oscillates. An operator calls
+`restore_capability()`, which is refused while the cause is still present — the same
+evidence discipline as SAFE exit (R9).
+
+**The limitation, stated plainly.** Pre-validated means measured. The budgets
+(2.00 / 1.60 / 1.10 W) are estimates. And worth keeping visible: BIRD's degradation
+was *ground-authored*. No mission in the studied set selected a degraded configuration
+autonomously, so this is research rather than replication — derived from what the
+failures suggest, not from a flight-proven pattern.
+
 
 ---
 
@@ -212,7 +250,7 @@ the truth.
 
 ### R10 — The system must represent "cause unknown" explicitly and act conservatively
 **Evidence in case study:** 63% of the record — the single largest bucket.
-**Status: PARTIALLY MET.**
+**Status: MET.**
 
 The representation exists and is honest: `diagnose()` returns `Cause.UNKNOWN` rather
 than inventing a cause, `UNKNOWN_ANOMALY` latches when something is flagged and no
@@ -223,15 +261,21 @@ an unknown cause authorises nothing.
 - Tests: `tests/test_diagnosis.py::test_advisory_only_evidence_yields_unknown_not_an_invented_cause`,
   `::test_unknown_anomaly_flag_is_raised_and_no_action_is_taken`
 
-**Why "partial" and not "met":** no scenario in the suite drives the UNKNOWN path
-end-to-end — `unknown_held` is 0 across all 15 scenarios. The path is unit-tested but
-never exercised by the integrated system, so "acts conservatively when it does not
-know" is an asserted property, not a demonstrated one. Given this requirement traces
-to the *largest* category in the dataset, that gap is the most consequential one on
-this page.
+**Closed 2026-08-12.** This was the most consequential gap on the page: `unknown_held`
+was 0 across every scenario, so "acts conservatively when it does not know" was an
+asserted property rather than a demonstrated one — for the requirement tracing to the
+*largest* category in the dataset.
 
-**To close:** a scenario injecting a fault signature the rule set deliberately does
-not cover, asserting UNKNOWN is held and no action is taken.
+The `unexplained transient` scenario now drives it end to end. The injected
+perturbation is sized to be **measurable and unexplainable**: 0.15 V is many σ against
+the variance the adaptive baseline learns from quiet data, but leaves the bus at
+~4.85 V — above the warning threshold, and inside the commissioning-reference band, so
+every deterministic rule stays silent. Result: **detected at 0.30 s, no cause named,
+`unknown_held`, zero actions.**
+
+The assertion that carries the weight is the forbid list. When the spacecraft cannot
+explain what it sees it must take no autonomous action at all, because an invented
+diagnosis authorising a wrong action is the Delfi-C3 failure.
 
 ---
 

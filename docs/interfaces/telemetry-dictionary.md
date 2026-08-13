@@ -58,6 +58,7 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 1 | NOMINAL |
 | 2 | SAFE |
 | 3 | TEST |
+| 4 | DEGRADED |
 
 ## Fault Flag Bits (offset 9, uint32 bitmask)
 
@@ -79,7 +80,8 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 13 | Sensor invalid: a channel returned a non-finite value (NaN/inf) | F3 |
 | 14 | Sensor implausible: one device returning impossible values, its bus healthy | FDIR-012 |
 | 15 | Rail overcurrent: a switchable rail above its nominal ceiling | FDIR-011 |
-| 16-31 | Reserved | — |
+| 16 | Drift from the commissioning reference (not from a learned baseline) | R7 |
+| 17-31 | Reserved | — |
 
 **On bit 13.** Added after the V0 adversarial safety review. Every comparison
 with NaN is False in both Python and C, so a NaN reading silently satisfied or
@@ -100,6 +102,20 @@ one bus failing together is better explained by the bus, but *one* device failin
 alone genuinely is a device fault, and nothing latched for that case until now. Like
 bit 13 it carries no authority — the sensor, its wiring and its connector all fit the
 evidence equally, so acting would mean inventing a diagnosis.
+
+**On bit 16 (R7).** Drift measured against a reference captured at COMMISSIONING and
+persisted, not against a baseline learned in flight. The distinction is the whole
+requirement: an adaptive baseline follows the signal, so a slow enough decline becomes
+the new normal — QuakeSat's shape, and measured at 0% recall in this project's own ML
+evaluation. Because it is grounded in a fixed physical number rather than a
+statistical one, it is deterministic evidence and may drive a degraded-mode selection;
+`ADAPTIVE_ANOMALY` may not.
+
+**On Mode 4, DEGRADED.** Running, but deliberately shedding capability to preserve the
+mission. It sits between NOMINAL and SAFE because a vehicle whose only options are
+those two throws away every mission-hour a reduced configuration could still earn —
+BIRD's lesson. See `fdir/degraded.py`, **including its statement that the capability
+sets are declared and not yet measured.**
 
 Bit 15 is the KySat-2 bit. That spacecraft lost its battery to a rail that kept
 drawing while every fixed *voltage* threshold stayed satisfied; the current is where

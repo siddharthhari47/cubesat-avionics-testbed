@@ -110,6 +110,13 @@ class Mode(IntEnum):
     NOMINAL = 1
     SAFE = 2
     TEST = 3
+    # R8. Running, but deliberately shedding capability to preserve the
+    # mission -- BIRD's lesson. Between NOMINAL and SAFE by design: SAFE means
+    # "stop and wait for the ground", and a vehicle whose only options are
+    # those two throws away every mission-hour a reduced configuration could
+    # still have earned. See fdir/degraded.py, including its statement that
+    # the capability sets are DECLARED and not yet measured.
+    DEGRADED = 4
 
 
 class FaultFlag(IntFlag):
@@ -176,6 +183,17 @@ class FaultFlag(IntFlag):
     # makes it visible is the one hardware capability the failure research put
     # a purchase deadline on.
     RAIL_OVERCURRENT = 1 << 15
+    # R7. A channel has drifted away from the reference captured at
+    # COMMISSIONING, rather than from a baseline learned in flight. The
+    # distinction is the entire requirement: an adaptive baseline absorbs slow
+    # change as the new normal, which is exactly how QuakeSat's degradation
+    # went unremarked. A fixed reference cannot be talked into moving.
+    #
+    # Unlike ADAPTIVE_ANOMALY this is grounded in a fixed, physically
+    # meaningful number, so it is deterministic evidence rather than a
+    # statistical hint -- which is what lets it drive a degraded-mode decision
+    # (R8) while ADAPTIVE_ANOMALY may not.
+    DRIFT_FROM_REFERENCE = 1 << 16
 
 
 class HealthFlag(IntFlag):
