@@ -37,7 +37,8 @@ simulation, and I've been deliberate about labelling what that does and doesn't 
 | | State | What that means |
 |---|---|---|
 | Simulator, ground station, fault injection | **Simulated** | Runs end-to-end over a live TCP link. Telemetry, telecommands, acknowledgements, CSV logging, fault injection, recovery. |
-| Deterministic FDIR engine (`fdir/`) | **Simulated** | Pulled out into its own hardware-agnostic package. 154 automated tests covering debounce timing, mode transitions, SAFE-mode recovery gating. |
+| Deterministic FDIR engine (`fdir/`) | **Simulated** | Its own hardware-agnostic package — detectors, diagnosis, bounded recovery campaigns, degraded modes. 332 automated tests. |
+| Fault-injection scenarios (`scenarios/`) | **Simulated** | 15 scenarios, each with negative assertions. Every one detected and correctly diagnosed; the numbers are below. |
 | Anomaly detection (`ml/`) | **Trained** | An Isolation Forest trained on synthetic nominal telemetry and evaluated against held-out episodes. Synthetic data only. |
 | Firmware (`firmware/`) | **Not built** | Planning docs and hand-written C structs matching the wire protocol. Never compiled, never flashed. |
 | Anything at all | **Hardware-tested** | No. Not one line. There is no board yet. |
@@ -97,8 +98,71 @@ assumed.
 The anomaly score is a path-length statistic. It is **not** a probability, and I don't
 present it as one anywhere.
 
+One number moved a lot when I made the evaluation honest. The report used to score the
+model without the debounce the deployed system actually applies — so it was measuring a
+detector that doesn't exist. With the debounce in, recall drops across the board
+(thermal 1.00 → 0.47) and the false-alarm rate falls off a cliff: **100% of episodes
+→ 2.5%.** The old recall figures were not achievable by the thing I'd actually built.
+
 Full numbers, including the false-positive rates and a fairly long list of things
 synthetic data can't tell me: [`docs/architecture/ml-evaluation-report.md`](docs/architecture/ml-evaluation-report.md).
+
+## The one measurement that decided a purchase
+
+I wanted the hardware list to be justified rather than assumed, so the scenario suite
+runs some faults twice — once with per-rail current sensing available to the FDIR
+layer, once with it blinded. Same fault, same seed, same everything else:
+
+| | Detection | Diagnosis |
+|---|---|---|
+| radio latch-up, **with** per-rail current | **0.70 s** | `RADIO_LATCHUP` ✅ |
+| radio latch-up, **without** | 5.10 s | `GROUND_LINK_LOST` ❌ |
+
+Seven times faster and correct, versus slow and wrong. A latch-up and a merely quiet
+radio look identical on the link itself — the current draw is the only thing that
+separates them. That's the argument for the INA219 on the parts list, and I'd rather
+have it as a measurement than as an opinion.
+
+The blinded halves of those pairs stay in the suite permanently. Delete them and it
+goes back to being an opinion.
+
+## I went looking for bugs in my own work, and found ten
+
+The line at the top of this README — that a system is good because you can show it was
+checked, not because it works — felt a bit cheap to write and then not act on. So I ran
+two adversarial passes over the FDIR core, attacking each safety property I'd claimed,
+with probes that execute rather than by re-reading code I'd already convinced myself
+about.
+
+Ten real defects. Three were serious:
+
+- **A stuck flag meant a permanently confident wrong diagnosis.** `DATA_PATH_SUSPECT`
+  was in neither of the two sets that let a flag be cleared, so one transient bus glitch
+  latched it forever — and since the diagnosis layer checks that flag *first* by design,
+  every later diagnosis came back "data path fault" at high confidence on a completely
+  healthy vehicle, hiding real faults underneath. That's the exact failure mode the
+  module was written to prevent, reintroduced through a latch that couldn't clear.
+- **NaN counted as proof a fault had cleared.** Every comparison with NaN is false, so a
+  NaN bus voltage skipped the undervoltage check and got recorded as evidence the
+  condition had gone away. A vehicle correctly held in SAFE could be returned to service
+  on readings that meant nothing.
+- **The spacecraft couldn't notice a silent link failure.** "Connected" was defined as
+  "a socket object exists", which stays true indefinitely when the other end vanishes —
+  so the comms-loss flag, the only thing that can trigger the radio recovery ladder,
+  could never fire during exactly the failure that ladder was built for.
+
+All ten are fixed and pinned by regression tests. Two things I'd rather say out loud:
+fixing one of them exposed a test that had been passing *because* of the bug it was
+supposed to catch, and a second uncovered that a 5-second debounce had never once
+actually run in any test or scenario. That happened four separate times — a latching
+flag being read as if it were live state.
+
+The write-up, including the two concerns that measurement *refuted*:
+[`docs/architecture/v0-adversarial-safety-review.md`](docs/architecture/v0-adversarial-safety-review.md).
+
+What this doesn't establish: I reviewed my own code. Three of the ten only surfaced
+because fixing something else disturbed them, which is fairly weak evidence that a
+genuinely independent pass wouldn't find more.
 
 ## Running it
 
@@ -122,7 +186,9 @@ link, which is how the real thing would behave.
 At the simulator's own prompt you can break things:
 
 ```
-fault undervoltage | thermal | sensor_timeout | sensor_lockup | gradual_drift | clear
+fault undervoltage | thermal | sensor_timeout | sensor_lockup | gradual_drift
+      | radio_latchup | radio_unresponsive | rail_overcurrent | data_bus_failure
+      | sensor_corruption | communication_loss | unexplained_transient | clear
 reboot | status | quit
 ```
 
@@ -134,6 +200,17 @@ real interface; stdin here is me walking over and unplugging something.
 ```bash
 pytest
 ```
+
+**The scenario suite**, which is where the numbers in this README come from:
+
+```bash
+python scenarios/runner.py
+```
+
+It exits non-zero if any negative assertion is violated, so it can gate a build. The
+negative assertions matter more than the positive ones — most of the spacecraft
+failures I read about weren't missed detections, they were the system confidently doing
+the wrong thing.
 
 **The ML pipeline** — no hardware needed, it runs entirely against the simulator:
 
@@ -151,11 +228,12 @@ point scoring a detector against it.
 
 ```
 simulator/          Spacecraft physics, fault injection, telemetry, TCP server
-fdir/               Deterministic fault detection engine. No sockets, no threads, no ML
+fdir/               Deterministic FDIR engine. No sockets, no threads, no ML
+scenarios/          Fault-injection scenarios with measured outcomes
 ml/                 Dataset generation, features, training, evaluation, embedded export
 ground-station/     Python mission-control dashboard
 firmware/           STM32 C. Planning and protocol headers only, nothing built
-tests/              154 tests
+tests/              332 tests
 docs/requirements/  System requirements, each with an ID and a verification method
 docs/architecture/  Block diagram, mode state machine, engineering decisions, ML report
 docs/interfaces/    Telemetry and command dictionaries — the byte-level contract
@@ -187,11 +265,25 @@ Because it would be strange to write all of the above and imply it's finished:
 
 - Every threshold and debounce window is a design target I picked. None are measured. They
   get revisited the moment real hardware exists to characterise.
+- The degraded modes are the clearest case of that. The requirement says capability sets
+  should be *pre-validated*, and pre-validated means measured — nobody has put a meter on
+  a rail and confirmed the minimal configuration actually closes its energy balance. The
+  mechanism works and is tested; the power budgets are estimates, flagged as such in code
+  with a test that fails if anyone quietly upgrades them to facts.
+- Autonomous degradation is also the one thing here I can't point at a real mission for.
+  BIRD survived losing most of its attitude control by running reduced — but a human on
+  the ground decided that. Nothing I read did it by itself. So that part is research
+  rather than copying something proven.
 - The C header the model exports has never been compiled. No toolchain here, no board yet.
 - The CRC32 in the firmware header is documented to match Python's `zlib.crc32` but hasn't
   been cross-checked against a real C implementation. First job when the board arrives.
 - The simulator models sensor noise as clean Gaussian. Real sensors are not that polite.
 - Whether the ML layer should ever get more authority than "raise a flag" is genuinely
   open. I'm not deciding it on synthetic data.
+- Every scenario in the suite is one I chose and modelled. It detects everything it was
+  built to detect, which proves the detectors work and proves nothing about whether
+  they're sufficient. The research that shaped this project found that 63% of catalogued
+  CubeSat failures have no stated technical cause at all — I can't build a scenario for
+  those, and I've tried not to let a clean results table imply otherwise.
 
 If something looks unfinished, it probably is.
