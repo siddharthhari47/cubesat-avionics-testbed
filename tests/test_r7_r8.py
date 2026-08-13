@@ -26,7 +26,8 @@ from fdir.diagnosis import Cause, diagnose  # noqa: E402
 from fdir.engine import FDIREngine  # noqa: E402
 from fdir.executor import RecoveryExecutor  # noqa: E402
 from fdir.ports import RecoveryAction  # noqa: E402
-from icd import FaultFlag, Mode, Rail, RawSample  # noqa: E402
+from fdir.recovery import Rung, VerifyCondition  # noqa: E402
+from icd import Device, FaultFlag, Mode, Rail, RawSample  # noqa: E402
 
 RAILS = {int(Rail.OBC): 0.12, int(Rail.RADIO): 0.10, int(Rail.SENSORS): 0.06,
          int(Rail.ADCS): 0.08, int(Rail.PAYLOAD): 0.04}
@@ -485,3 +486,37 @@ def test_corrupt_capability_state_is_discarded(bad):
     e = FDIREngine()
     e.import_capability_state(bad, 0.0)
     assert e.capability is FULL
+
+
+# ---------------------------------------------------------------------------
+# Round 5 doc-audit: the new actions inherited none of F2's validation
+# ---------------------------------------------------------------------------
+
+def test_every_recovery_action_declares_its_target_vocabulary():
+    """
+    THE GENERAL FORM, so this cannot happen a third time. POWER_OFF and POWER_ON
+    were added to fix load shedding and inherited none of the Rail/Device
+    validation that exists precisely to stop this -- the F2 defect class
+    reappearing inside the fix for a different bug, which is round 4's lesson
+    stated as code.
+
+    A new action with no declared vocabulary now fails here rather than silently
+    accepting any integer.
+    """
+    from fdir.recovery import _ACTION_TARGET_TYPE
+
+    undeclared = [a.name for a in RecoveryAction
+                  if a != RecoveryAction.NONE and a not in _ACTION_TARGET_TYPE]
+    assert not undeclared, (
+        f"{undeclared} have no target vocabulary. Rail and Device ids overlap "
+        f"numerically, so an unvalidated target cannot be caught by value."
+    )
+
+
+@pytest.mark.parametrize("action", [RecoveryAction.POWER_CYCLE,
+                                    RecoveryAction.POWER_OFF,
+                                    RecoveryAction.POWER_ON])
+def test_rail_actions_refuse_a_device_target(action):
+    with pytest.raises(ValueError):
+        Rung(action, Device.RADIO, 1, VerifyCondition.RADIO_RESPONSIVE)
+    Rung(action, Rail.RADIO, 1, VerifyCondition.RADIO_RESPONSIVE)   # must not raise

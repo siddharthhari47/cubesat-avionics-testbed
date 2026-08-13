@@ -43,6 +43,17 @@ from .ports import RecoveryAction  # noqa: E402
 _DEVICE_IDS = {int(d) for d in Device}
 _RAIL_IDS = {int(r) for r in Rail}
 
+# Which vocabulary each action's target belongs to. Every member of
+# RecoveryAction except NONE must appear here; tests/test_r7_r8.py asserts it,
+# so adding an action without declaring its target type fails the suite rather
+# than silently accepting anything.
+_ACTION_TARGET_TYPE = {
+    RecoveryAction.POWER_CYCLE: Rail,
+    RecoveryAction.POWER_OFF: Rail,
+    RecoveryAction.POWER_ON: Rail,
+    RecoveryAction.RESET_DEVICE: Device,
+}
+
 
 class VerifyCondition(IntEnum):
     """
@@ -132,23 +143,28 @@ class Rung:
         # checked. IntEnum members still behave as ints everywhere downstream
         # (the executor and the ports are unchanged), but Rail.RADIO is not an
         # instance of Device, which is the distinction that actually matters.
-        if self.action == RecoveryAction.RESET_DEVICE:
-            if self.target == SYSTEM_TARGET:
-                return
-            if not isinstance(self.target, Device):
-                raise ValueError(
-                    f"RESET_DEVICE target must be a Device member or "
-                    f"SYSTEM_TARGET, got {self.target!r} "
-                    f"({type(self.target).__name__}). Passing a Rail here is "
-                    f"the F2 defect and is not detectable by value."
-                )
-        elif self.action == RecoveryAction.POWER_CYCLE:
-            if not isinstance(self.target, Rail):
-                raise ValueError(
-                    f"POWER_CYCLE target must be a Rail member, got "
-                    f"{self.target!r} ({type(self.target).__name__}). Passing a "
-                    f"Device here is the F2 defect and is not detectable by value."
-                )
+        # Driven by a TABLE rather than an if-chain, so a new action cannot
+        # quietly arrive without a vocabulary. POWER_OFF and POWER_ON did
+        # exactly that: they were added to fix load shedding and inherited none
+        # of this validation, so `Rung(POWER_OFF, Device.RADIO, ...)` was
+        # accepted -- the F2 defect class reappearing inside the fix for a
+        # different bug. _ACTION_TARGET_TYPE is asserted complete by a test.
+        expected = _ACTION_TARGET_TYPE.get(self.action)
+        if expected is None:
+            raise ValueError(
+                f"{self.action.name} has no declared target vocabulary. Add it "
+                f"to _ACTION_TARGET_TYPE -- Rail and Device ids overlap "
+                f"numerically, so an unvalidated target is undetectable by value."
+            )
+        if self.target == SYSTEM_TARGET and expected is Device:
+            return          # whole-spacecraft reset
+        if not isinstance(self.target, expected):
+            raise ValueError(
+                f"{self.action.name} target must be a {expected.__name__} member"
+                f"{' or SYSTEM_TARGET' if expected is Device else ''}, got "
+                f"{self.target!r} ({type(self.target).__name__}). Rail.RADIO is 1 "
+                f"and so is Device.MAG, so this is not detectable by value."
+            )
 
 
 @dataclass
