@@ -180,6 +180,10 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
             r.recovery_latency_s = round(h.env.t - injected_at, 3)
     r.final_mode = Mode(h.engine.mode).name
 
+    # Captured BEFORE the display placeholder below overwrites r.diagnosis --
+    # the outcome classification needs the fact, not the rendered string.
+    named_a_cause = r.diagnosis is not None
+
     if sc.expect_cause is Cause.UNKNOWN:
         # "Correct" here means the spacecraft never talked itself into a named
         # cause. r.diagnosis only ever records a KNOWN diagnosis, so absence is
@@ -204,17 +208,25 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
     elif r.recovery_verified:
         r.outcome = Outcome.RECOVERED
     elif (h.engine.fault_flags & FaultFlag.UNKNOWN_ANOMALY
-          and h.engine.diagnosis.cause == Cause.UNKNOWN):
-        # BOTH conditions, not just the flag. UNKNOWN_ANOMALY latches, so
-        # testing it alone labels a whole run by a moment: the rail-overcurrent
-        # scenario briefly had an advisory signal it could not yet explain
-        # (before the 0.5 s current debounce elapsed), latched the flag, then
-        # correctly identified the cause -- and was still being reported as
-        # "unknown_held" at the end on the strength of that transient.
+          and h.engine.diagnosis.cause == Cause.UNKNOWN
+          and not named_a_cause):
+        # THREE conditions, and each was added because the previous version
+        # mislabelled a run.
         #
-        # unknown_held has to mean "we still do not know", which is a statement
-        # about the FINAL state. Same latching-flag-read-as-live-state mistake
-        # the safety review kept turning up.
+        # The flag alone is not enough: UNKNOWN_ANOMALY latches, so a run that
+        # briefly could not explain itself was labelled by that moment even
+        # after identifying the cause.
+        #
+        # The final diagnosis alone is not enough either. The rail-overcurrent
+        # run names RAIL_OVERCURRENT, sheds the offending rail, and the
+        # overcurrent genuinely goes away -- at which point diagnose() rightly
+        # declines to assert anything and an advisory flag from the load-shed
+        # transient is all that remains. Labelling THAT "unknown_held" reports
+        # a successful containment as a failure to understand.
+        #
+        # So: unknown_held means the spacecraft never named a cause at any
+        # point in the run. `r.diagnosis` records the first KNOWN diagnosis, so
+        # its absence is the honest test.
         r.outcome = Outcome.UNKNOWN_HELD
     elif (h.engine.fault_flags & FaultFlag.RECOVERY_FAILED
           or h.engine.mode in (Mode.SAFE, Mode.DEGRADED)):

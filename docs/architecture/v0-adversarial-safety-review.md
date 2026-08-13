@@ -16,6 +16,12 @@ states plainly what this review is and is not.
 > recorded as such. **Round 2 is now fixed too — ten findings, all ten closed, 288
 > tests.** Fixing K1 then revealed that `COMMS_LOSS_TIMEOUT_S` had never once been
 > exercised by any test or scenario; see §7.
+>
+> **ROUND 3 (§8) was the independent pass §5 said was missing, and it found six more
+> defects in code written the same day** -- including a CRITICAL one where a bad
+> commissioning reference was a permanent trap with no way out. Sixteen findings across
+> three rounds, all fixed, **356 tests**. The prediction that an outside look would find
+> more was correct, by a wider margin than expected.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -644,14 +650,83 @@ This is the third instance of the same pattern — a test passing because of a d
 rather than in spite of one. F2's R4 assertion, K1's verdict-shaped evidence, and now a
 debounce that never ran.
 
-### Standing after both rounds
+---
 
-**Ten findings, all ten fixed.** Every dimension originally planned has been run.
-Suite: 249 → **288 passing** (39 regression tests). Scenario outcome distribution
-unchanged and negative assertions still clean.
+## 8. Round 3 -- an independent pass, and what it found
 
-What has *not* been done is an independent adversarial pass over these conclusions —
-both rounds were a single reviewer who wrote most of the code, and that limitation from
-§5 is unchanged. Three of the ten findings were only found because fixing something
-else disturbed them, which is weak evidence that a genuinely independent pass would
-still find more.
+Both earlier rounds were me auditing my own code. Section 5 said the missing thing was
+an independent pass, and that three of ten findings had only surfaced because fixing
+something else disturbed them -- weak evidence that a real outside look would find more.
+
+It did. **Six defects, all in code written the same day**, all in code I had just
+tested, documented and been confident about.
+
+| # | Severity | Defect |
+|---|---|---|
+| N1 | **CRITICAL** | The commissioning guard read a flag written *later in the same tick*, inverting itself -- and a bad reference was a permanent trap with no way out |
+| N2 | HIGH | Suppressed device faults recorded *positive evidence of health* -- the F3/D2 class, in new code |
+| N5 | **HIGH** | A latched-but-cleared overcurrent masked a live undervoltage, asserting the exact inverse of the truth |
+| N6 | HIGH | Comms loss masked a live overcurrent on every non-radio rail |
+| N3 | MEDIUM | `MAG_OK` cleared before its debounce and never restored by anything |
+| N4 | MEDIUM | Restoring capability overwrote `BOOT`, skipping the self-check; and mode did not follow capability |
+
+### N1 was a trap, not just a bug
+
+The commissioning guard tested `UNDERVOLTAGE_WARNING`, which `_update_undervoltage`
+writes **two calls later in the same tick**. So it evaluated the *previous* tick's
+verdict -- and inverted exactly: a low sample was admitted because its flag had not been
+set yet, and the good sample after it was rejected because the flag was still set from
+before. Measured on an alternating 4.2/5.0 V supply, the reference captured **4.24 V**
+where it should have captured 5.00 V.
+
+Then the second half. The reference is persisted and never recaptured *by design* --
+that is R7's whole point. So a wrong reference latches `DRIFT_FROM_REFERENCE` on
+perfectly nominal telemetry, which selects a degraded capability set, and **there was no
+way back**: the flag cannot clear because the condition really is breaching against that
+reference, so `RESET_FAULTS` refuses forever and `restore_capability()` refuses with it.
+The vehicle sheds its payload for the rest of the mission over a measurement error.
+
+Fixed three ways -- the guard now judges the sample directly rather than a latched flag,
+so ordering cannot reintroduce it; the detector moved after the ones it consults; and
+`recommission_reference()` is the escape hatch that was missing. **A latching detector
+whose reference can be wrong needs a way to correct the reference, or it is a trap.**
+
+### Four of six were two mistakes I keep making
+
+N5, and the outcome-classification bug found beside it, are both *a latched flag read as
+live state* -- the F1 defect class, now the **fifth and sixth** instance. N1 is *state
+read before the thing that writes it has run*. These are not unrelated slips, they are
+two habits, and both are now covered by tests that generalise rather than tests pinning
+one instance.
+
+### The run itself failed, and that matters
+
+13 of 15 agents died on a monthly spend limit -- **including every refuter**. The
+workflow therefore returned `confirmed_count: 0`, which is not the same as "nothing was
+found": the verifiers never ran, so the pipeline discarded findings it had no way to
+check. Two of five lenses completed and returned everything above.
+
+I verified all six myself by probe before fixing any of them, so nothing here rests on
+an unverified agent claim. But the honest reading is that **three of five planned lenses
+never ran at all** -- `degraded-authority`, `reference-persistence`, and the one whose
+only job was to check this document's own claims against the code. Absence of findings
+there is absence of review.
+
+---
+
+### Standing after three rounds
+
+**Sixteen findings across three rounds, all sixteen fixed.** Suite: 249 → **356
+passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
+
+The section 5 prediction that an independent pass would find more was correct, and by
+a wider margin than expected: six defects in a single day's work, two of them in the
+severity band the first two rounds' worst findings occupied.
+
+**And the pattern is worth stating plainly rather than filing as trivia.** Every round
+so far has found real defects, including in code written *immediately after* the
+previous round's lessons. That is not evidence the code is converging on correct. It
+is evidence that one reviewer, however careful, is a weak instrument -- and that the
+rate at which this project finds its own bugs is bounded by how hard it is willing to
+look, not by how many bugs are there.
+

@@ -304,11 +304,17 @@ class FDIREngine:
         # been ruled out as the explanation.
         self._update_plausibility(sample, now)
         self._update_rail_overcurrent(sample, now)
-        self._update_reference_drift(sample, now)
         self._update_sensor_timeout(sample, now)
         self._update_undervoltage(sample, now)
         self._update_thermal(sample, now)
         self._update_lockup(sample, now)
+        # AFTER the detectors whose verdicts it consults. Placed earlier, its
+        # commissioning guard read fault_flags before _update_undervoltage had
+        # written them this tick, so it evaluated the PREVIOUS tick's verdict --
+        # and inverted itself exactly: a low sample was admitted because its
+        # flag had not been set yet, and the good sample after it was rejected
+        # because the flag was still set from the tick before.
+        self._update_reference_drift(sample, now)
         self._update_adaptive_baseline(sample, now)
         self._update_ml_advisory(ml_advisory, now)
 
@@ -535,18 +541,36 @@ class FDIREngine:
         suspect = getattr(self, "_suspect_now", set())
         # Non-finite readings are SENSOR_INVALID's business, not this one.
         suspect = suspect - sample.invalid_devices()
-        breaching = bool(suspect) and not (self.fault_flags & FaultFlag.DATA_PATH_SUSPECT)
+
+        if self.fault_flags & FaultFlag.DATA_PATH_SUSPECT:
+            # Record NO evidence in either direction. Recording non-breach here
+            # was the F3/D2 defect in new clothes: while a zeroed bus made every
+            # device look broken, this counted each of those ticks as proof the
+            # devices were fine, and RESET_FAULTS then cleared SENSOR_IMPLAUSIBLE
+            # with the channels still suspect. _update_undervoltage already has
+            # the right pattern for this fifteen lines below.
+            self._implausible_count = 0
+            return
+
+        breaching = bool(suspect)
         self._observe(FaultFlag.SENSOR_IMPLAUSIBLE, breaching)
         if not breaching:
             self._implausible_count = 0
+            # This detector OWNS MAG_OK -- no other detector sets it, so if it
+            # does not restore the bit nothing ever will. IMU_OK and TEMP_OK
+            # belong to the timeout and thermal detectors and are deliberately
+            # not touched here; clearing them from this method achieved nothing
+            # anyway, since both are unconditionally rewritten later in the
+            # same tick.
+            self.health_flags |= HealthFlag.MAG_OK
             return
         self._implausible_count += 1
-        for device in suspect:
-            bit = {Device.IMU: HealthFlag.IMU_OK, Device.MAG: HealthFlag.MAG_OK,
-                   Device.TEMP: HealthFlag.TEMP_OK}.get(device)
-            if bit is not None:
-                self.health_flags &= ~bit
         if self._implausible_count >= cfg.IMPLAUSIBLE_DEBOUNCE_SAMPLES:
+            if Device.MAG in suspect:
+                # Only after the debounce. Clearing on the first bad sample made
+                # a one-tick glitch mark the magnetometer unhealthy permanently,
+                # which is precisely what the debounce exists to prevent.
+                self.health_flags &= ~HealthFlag.MAG_OK
             if not self.fault_flags & FaultFlag.SENSOR_IMPLAUSIBLE:
                 names = ", ".join(sorted(d.name for d in suspect))
                 self._emit(now, f"SENSOR_IMPLAUSIBLE latched ({names}) -- device-level "
@@ -610,7 +634,13 @@ class FDIREngine:
         if self.voltage_reference is None:
             # Commissioning. Only clean samples contribute -- a reference
             # captured while something is already wrong is worse than none.
-            if self.fault_flags & (SAFE_MODE_TRIGGER_FLAGS | FaultFlag.UNDERVOLTAGE_WARNING):
+            # Judged from THIS sample, not from a latched flag. Flags are
+            # written by other detectors during the same tick, so reading them
+            # here made the guard depend on call order -- which is how it came
+            # to admit exactly the samples it was written to exclude.
+            if sample.bus_voltage_v < cfg.UNDERVOLTAGE_WARNING_V:
+                return
+            if self.fault_flags & SAFE_MODE_TRIGGER_FLAGS:
                 return
             self._reference_samples.append(sample.bus_voltage_v)
             if len(self._reference_samples) >= cfg.REFERENCE_CAPTURE_SAMPLES:
@@ -660,9 +690,35 @@ class FDIREngine:
             self._emit(now, f"capability state discarded (unreadable: {exc})")
             return
         self.capability = set_for_level(level)
-        if level > 0:
-            self.mode = Mode.DEGRADED
+        # Deliberately does NOT set self.mode. Writing DEGRADED here overwrote
+        # BOOT, skipping the boot self-check and every warm-up gate that hangs
+        # off it -- COMMS_LOSS latched on the first post-reset link report.
+        # _update_degraded_mode puts the vehicle in DEGRADED once boot ends,
+        # which is the same answer arrived at without breaking the sequence.
         self._emit(now, f"capability restored after reset: {self.capability.name}")
+
+    def recommission_reference(self, now: float) -> None:
+        """
+        Operator command: discard the commissioning reference and capture a new one.
+
+        THE ESCAPE HATCH, and it was missing. A reference captured wrongly makes
+        DRIFT_FROM_REFERENCE latch on perfectly nominal telemetry, which then
+        selects a degraded capability set -- and there was no way back. The flag
+        cannot clear, because the condition really is breaching against that bad
+        reference; RESET_FAULTS therefore refuses forever, and
+        restore_capability() refuses forever with it. The vehicle sheds its
+        payload and stays that way for the rest of the mission.
+
+        A latching detector whose reference can be wrong needs a way to correct
+        the reference, or it is a trap rather than a detector.
+        """
+        self.voltage_reference = None
+        self._reference_samples = []
+        self._drift_since = None
+        self.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
+        self._clean_ticks.pop(int(FaultFlag.DRIFT_FROM_REFERENCE), None)
+        self._emit(now, "commissioning reference discarded by operator command; "
+                        "recapturing from the next clean samples")
 
     def export_reference_state(self) -> Optional[dict]:
         """Commissioning reference, for NVM. Written once, then never again."""
@@ -705,6 +761,16 @@ class FDIREngine:
         """
         if self.mode in (Mode.BOOT, Mode.SAFE):
             return
+        # Mode must follow capability even when no flag currently argues for a
+        # downgrade. After a reset the capability is restored from NVM while the
+        # flags that caused it are gone, so the vehicle sat at REDUCED and
+        # reported NOMINAL -- telling the ground it was fully capable while its
+        # payload rail was physically off.
+        if self.capability.level > 0 and self.mode == Mode.NOMINAL:
+            self.mode = Mode.DEGRADED
+            self._emit(now, f"-> DEGRADED: operating at {self.capability.name} "
+                            f"(capability restored across a reset)")
+
         want = select_level(self.fault_flags)
         if want <= self.capability.level:
             return

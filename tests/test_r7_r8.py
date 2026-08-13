@@ -307,6 +307,12 @@ def test_rails_to_shed_names_only_the_difference():
 # Two defects found by probing the R8 implementation after writing it
 # ---------------------------------------------------------------------------
 
+def _power_port(env):
+    sys.path.insert(0, str(REPO_ROOT / "simulator"))
+    from hardware_sim import SimulatedPowerPort
+    return SimulatedPowerPort(env)
+
+
 def _wired():
     """Engine + executor + environment, so actions reach simulated hardware."""
     sys.path.insert(0, str(REPO_ROOT / "simulator"))
@@ -368,8 +374,17 @@ def test_capability_survives_a_reboot():
     fresh.import_capability_state(saved, env.t)
 
     assert fresh.capability is REDUCED
-    assert fresh.mode == Mode.DEGRADED
     assert env.rail_powered[Rail.PAYLOAD] is False
+
+    # Mode is NOT set by the import. Writing DEGRADED there overwrote BOOT and
+    # skipped the boot self-check and every warm-up gate hanging off it. Boot
+    # runs first; _update_degraded_mode reaches the same answer afterwards
+    # without breaking the sequence.
+    assert fresh.mode == Mode.BOOT
+    ex2 = RecoveryExecutor(_power_port(env), None)
+    _spin(env, fresh, ex2, 40)
+    assert fresh.mode == Mode.DEGRADED
+    assert fresh.capability is REDUCED
 
 
 def test_restoring_capability_re_powers_the_shed_rails():

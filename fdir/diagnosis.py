@@ -98,7 +98,49 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
             "is a better explanation than simultaneous independent failures",
         )
 
-    # 2. Comms loss: latch-up and a merely-quiet link look identical on the
+    # 2. A rail over its ceiling, checked BEFORE the comms rule.
+    #
+    #    It used to sit below, and that masked real faults: the COMMS_LOSS rule
+    #    returns on every path and inspects only the RADIO rail, so a live
+    #    overcurrent on ADCS, SENSORS or PAYLOAD went undiagnosed whenever
+    #    ground contact happened to be stale -- while the evidence string
+    #    actively exonerated the power system. Moving this up costs nothing,
+    #    because the radio branch below reaches RADIO_LATCHUP for the one case
+    #    the old ordering was protecting.
+    #
+    #    Ordering against UNDERVOLTAGE_CRITICAL is the KySat-2 lesson: the drain
+    #    and the sag are one fault, and diagnosing the sag treats a symptom
+    #    while the cause keeps eating the battery.
+    if fault_flags & FaultFlag.RAIL_OVERCURRENT:
+        over = []
+        if sample is not None and sample.rail_current_a:
+            over = [(r, a) for r, a in sorted(sample.rail_current_a.items())
+                    if a > cfg.RAIL_NOMINAL_CURRENT_CEILING_A]
+        # REQUIRE LIVE EVIDENCE. RAIL_OVERCURRENT latches, so the bit outlives
+        # the condition; this rule used to fire on the stale bit alone and
+        # assert "any voltage sag is downstream of it" with every rail sitting
+        # at nominal -- masking a live UNDERVOLTAGE_CRITICAL and stating the
+        # exact inverse of the truth. That is the F1 defect class: a latched
+        # flag read as live state. If nothing is over its ceiling now, this
+        # rule has nothing to say and the acute rules below get their turn.
+        if over:
+            radio = [(r, a) for r, a in over if r == int(Rail.RADIO)]
+            if radio:
+                return Diagnosis(
+                    Cause.RADIO_LATCHUP, Confidence.LIKELY,
+                    f"the radio rail is drawing {radio[0][1]:.3f} A, well above "
+                    f"its nominal band -- a latch-up, caught on current before "
+                    f"the comms symptom has finished debouncing",
+                )
+            detail = ", ".join(f"{Rail(r).name} at {a:.3f} A" for r, a in over)
+            return Diagnosis(
+                Cause.RAIL_OVERCURRENT, Confidence.LIKELY,
+                f"{detail} against a {cfg.RAIL_NOMINAL_CURRENT_CEILING_A} A "
+                f"nominal ceiling; the draw is the cause, any voltage sag is "
+                f"downstream of it",
+            )
+
+    # 3. Comms loss: latch-up and a merely-quiet link look identical on the
     #    link itself. Per-rail current is what separates them -- which is the
     #    measurement the hardware shortlist exists to justify.
     if fault_flags & FaultFlag.COMMS_LOSS:
@@ -124,38 +166,6 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
             Cause.GROUND_LINK_LOST, Confidence.LIKELY,
             f"no ground contact and the radio rail is nominal "
             f"({rail_current:.3f} A), so the radio is probably not the fault",
-        )
-
-    # 2b. A rail over its ceiling outranks the undervoltage it will eventually
-    #     cause. This ordering IS the KySat-2 lesson: the drain and the sag are
-    #     one fault, and diagnosing the sag treats the symptom while the cause
-    #     keeps eating the battery. Below the COMMS_LOSS rule deliberately, so a
-    #     radio latch-up still reads as RADIO_LATCHUP rather than being
-    #     flattened into a generic overcurrent.
-    if fault_flags & FaultFlag.RAIL_OVERCURRENT:
-        over = []
-        if sample is not None and sample.rail_current_a:
-            over = [(r, a) for r, a in sorted(sample.rail_current_a.items())
-                    if a > cfg.RAIL_NOMINAL_CURRENT_CEILING_A]
-        # An overcurrent on the RADIO rail is a latch-up, and saying so does not
-        # require waiting for COMMS_LOSS to finish debouncing. The current rise
-        # is the earlier and more direct evidence -- rule 2 above reaches the
-        # same conclusion from the comms symptom, ~5 s later. Same answer, and
-        # this path gets there first.
-        radio = [(r, a) for r, a in over if r == int(Rail.RADIO)]
-        if radio:
-            return Diagnosis(
-                Cause.RADIO_LATCHUP, Confidence.LIKELY,
-                f"the radio rail is drawing {radio[0][1]:.3f} A, well above its "
-                f"nominal band -- a latch-up, caught on current before the "
-                f"comms symptom has finished debouncing",
-            )
-        detail = (", ".join(f"{Rail(r).name} at {a:.3f} A" for r, a in over)
-                  if over else "a rail above its ceiling")
-        return Diagnosis(
-            Cause.RAIL_OVERCURRENT, Confidence.LIKELY,
-            f"{detail} against a {cfg.RAIL_NOMINAL_CURRENT_CEILING_A} A nominal "
-            f"ceiling; the draw is the cause, any voltage sag is downstream of it",
         )
 
     if fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
