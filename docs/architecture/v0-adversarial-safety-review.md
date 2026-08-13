@@ -22,6 +22,12 @@ states plainly what this review is and is not.
 > commissioning reference was a permanent trap with no way out. Sixteen findings across
 > three rounds, all fixed, **356 tests**. The prediction that an outside look would find
 > more was correct, by a wider margin than expected.
+>
+> **ROUND 4 (§9) found six more, and three of them were in that morning's fixes.**
+> Twenty-four findings, all fixed, **375 tests**. The lesson is no longer "get an
+> outside look" -- it is that a fix is a code change like any other, and this project
+> has been verifying fixes against the defect they targeted and not against what they
+> broke.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -714,9 +720,68 @@ there is absence of review.
 
 ---
 
-### Standing after three rounds
+---
 
-**Sixteen findings across three rounds, all sixteen fixed.** Suite: 249 → **356
+## 9. Round 4 -- half the findings were in that morning's fixes
+
+Round 3's lesson was that an outside look finds what self-review misses. Round 4's is
+narrower and worse: **fixes in this system have their own defect rate, and it is high.**
+
+One of four lenses survived the spend limit. It returned six findings, all reproduced
+by probe. **Three were in code written hours earlier as repairs.**
+
+| # | Severity | Defect | Introduced by |
+|---|---|---|---|
+| F1 | **CRITICAL** | Commissioning guard calibrated to the 4.5 V undervoltage threshold, not the 0.25 V band the reference is judged by -- and unbounded above | original R7 |
+| F2 | HIGH | Two refused sheds killed autonomous degradation for the rest of the mission | round-4 self-probe fix |
+| F3 | HIGH | `restore_capability()` accepted mid-shed without checking the cause; the shed then landed anyway | round-4 self-probe fix |
+| F4 | HIGH | `recommission_reference()` and NVM persistence reachable from no telecommand and called by nothing outside tests | rounds 3 and 4 |
+| F5 | MEDIUM | An advisory flag could veto a deterministic detector | round-4 self-probe fix |
+| F6 | MEDIUM | A reset left the drift debounce and a partial capture behind | original R7 |
+
+### F1: the guard was calibrated against the wrong number
+
+The guard rejected only what the undervoltage detector would already have flagged --
+admitting **[4.5 V, +infinity)** while the reference is later held to **±0.25 V**. The
+admission window was wider than the tolerance, and unbounded on the high side because no
+overvoltage detector exists at all.
+
+Consequence, measured: a vehicle commissioned on a partly-discharged battery at 4.55 V
+-- *the normal post-deployment state, before the panels produce* -- captures 4.55 V.
+Charging to a healthy 5.00 V then latches `DRIFT_FROM_REFERENCE`, sheds the payload, and
+cannot clear. Round 3's trap, reached by a path round 3's fix did not cover.
+
+### F4: an escape the ground cannot reach is not an escape
+
+Round 3 added `recommission_reference()` and called it "the escape hatch that was
+missing". Round 4 found it callable from exactly one place in the repository: a test.
+`CommandId` stopped at `DISABLE = 0x09`. The same was true of every persistence method
+-- `export_reference_state`, `import_capability_state` and the rest were written, tested,
+and **called by nothing outside the test suite**, so the R7 reference and R8 capability
+survived a reboot only in tests. On the real path both were silently lost, which is
+exactly what each was written to prevent.
+
+Two new telecommands (`0x0A`, `0x0B`) and a real NVM save/restore now close it, verified
+over the live link.
+
+### F2, F3 and F5 were all self-inflicted that morning
+
+- The **bound** I added to stop an unbounded retry became a **permanent block** -- and
+  nothing cleared it, not a restore, not a recommission, not a fault reset.
+- The **two-phase commit** I added to stop a false capability claim opened a window
+  where an operator restore was accepted and then silently reversed by the shed it was
+  meant to prevent.
+- **Widening a guard** to catch more faults handed `ML_ANOMALY` a veto over whether a
+  deterministic detector could exist at all -- the exact inverse of this project's
+  central boundary, arrived at while fixing something else.
+
+Each fix was verified against the defect it targeted. None was checked for what it broke.
+
+---
+
+### Standing after four rounds
+
+**Twenty-four findings across four rounds, all twenty-four fixed.** Suite: 249 → **375
 passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by

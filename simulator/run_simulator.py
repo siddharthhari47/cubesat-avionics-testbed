@@ -116,6 +116,9 @@ class Simulator:
             sample, _truth = self.env.step(1.0 / self.telemetry_rate_hz)
             self.engine.tick(sample, now, ml_advisory=self._ml_advisory(sample))
             self._update_comms_loss(now)
+            # Cheap in V0; on hardware this becomes a wear-aware write of a
+            # fixed-size record to backup SRAM, not a per-tick flash cycle.
+            self._persist()
             return self._build_packet(sample)
 
     def _ml_advisory(self, sample):
@@ -155,6 +158,28 @@ class Simulator:
             last_seen = self.last_client_seen
         seconds_since_contact = None if last_seen is None else now - last_seen
         self.engine.note_link_state(now, link_established, seconds_since_contact)
+
+    # ---- non-volatile state -------------------------------------------------
+    # Round 4: export/import_reference_state and export/import_capability_state
+    # existed and were tested, and NOTHING CALLED THEM outside tests. The R7
+    # reference and the R8 capability were therefore persisted in the test suite
+    # only -- on the real reboot path both were silently lost, which is exactly
+    # the failure each was written to prevent.
+
+    def _persist(self) -> None:
+        """Snapshot the state that must survive a reset. Real firmware writes
+        backup SRAM here; V0 keeps it in memory across the OBC reset."""
+        self._nvm = {
+            "recovery": self.engine.export_recovery_state(),
+            "reference": self.engine.export_reference_state(),
+            "capability": self.engine.export_capability_state(),
+        }
+
+    def _restore(self, now: float) -> None:
+        nvm = getattr(self, "_nvm", None) or {}
+        self.engine.import_recovery_state(nvm.get("recovery"), now)
+        self.engine.import_reference_state(nvm.get("reference"), now)
+        self.engine.import_capability_state(nvm.get("capability"), now)
 
     def note_link_failure(self, conn) -> None:
         """
@@ -232,6 +257,17 @@ class Simulator:
 
         if cmd.cmd_id == CommandId.ENABLE:
             return AckStatus.ACCEPTED if self.engine.enter_test_mode() else AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
+        elif cmd.cmd_id == CommandId.RECOMMISSION_REFERENCE:
+            # The escape from a bad commissioning reference. Without this on the
+            # command path, a reference captured wrongly degrades the vehicle
+            # permanently and the ground can do nothing about it.
+            self.engine.recommission_reference(now)
+            self._persist()
+            return AckStatus.ACCEPTED
+        elif cmd.cmd_id == CommandId.RESTORE_CAPABILITY:
+            ok = self.engine.restore_capability(now)
+            self._persist()
+            return AckStatus.ACCEPTED if ok else AckStatus.REJECTED_CONDITION_STILL_ACTIVE
 
         if cmd.cmd_id == CommandId.DISABLE:
             return AckStatus.ACCEPTED if self.engine.exit_test_mode() else AckStatus.REJECTED_NOT_ALLOWED_IN_MODE
@@ -260,7 +296,9 @@ class Simulator:
             now = time.monotonic()
             self.boot_time = now
             self.seq_num = 0
+            self._persist()
             self.engine.watchdog_reset(now)
+            self._restore(now)
             print("[sim] simulated watchdog reset -> BOOT")
 
     def status_line(self) -> str:

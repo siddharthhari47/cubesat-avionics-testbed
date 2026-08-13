@@ -45,6 +45,8 @@ Every command gets exactly one of these back, per `COM-002` (within 1 s).
 | 0x07 | `REQUEST_LOG` | unused | `REJECTED_NOT_IMPLEMENTED` in V0 — no SD logging exists until V2 |
 | 0x08 | `ENABLE` (test function) | test function ID | Accepted only in NOMINAL/TEST, else `REJECTED_NOT_ALLOWED_IN_MODE` |
 | 0x09 | `DISABLE` (test function) | test function ID | Accepted only in TEST, else `REJECTED_NOT_ALLOWED_IN_MODE` |
+| `0x0A` | `RECOMMISSION_REFERENCE` | — | Discard the commissioning voltage reference and capture a new one. **The escape from R7's trap:** a reference captured wrongly makes the drift detector latch on healthy telemetry, which sheds a rail, and neither `RESET_FAULTS` nor a capability restore can clear it — the condition genuinely is breaching against a reference that is itself wrong. Always `ACCEPTED`. |
+| `0x0B` | `RESTORE_CAPABILITY` | — | Return to full capability from a degraded rung, re-powering shed rails. Refused with `REJECTED_CONDITION_STILL_ACTIVE` while the cause is present — the same evidence discipline as `EXIT_SAFE_MODE`. |
 
 ## Status enum (offset 5 of ack packet)
 

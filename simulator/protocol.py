@@ -37,6 +37,12 @@ class CommandId(IntEnum):
     REQUEST_LOG = 0x07
     ENABLE = 0x08
     DISABLE = 0x09
+    # R7/R8 operator escapes. Round 4 found both documented as "the escape
+    # hatch" while being reachable from no telecommand at all -- an escape the
+    # ground cannot reach is not an escape. Additive command ids, no packet
+    # layout change.
+    RECOMMISSION_REFERENCE = 0x0A
+    RESTORE_CAPABILITY = 0x0B
 
 
 class AckStatus(IntEnum):

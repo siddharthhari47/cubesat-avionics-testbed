@@ -105,6 +105,19 @@ EVENT_FLAGS = (
 
 RESETTABLE_FLAGS = CONDITION_BACKED_FLAGS | EVENT_FLAGS
 
+# Condition-backed flags MINUS the advisory ones. Anywhere a deterministic
+# decision asks "is something currently wrong", it must ask with this set.
+#
+# Round 4 found the reason: widening the commissioning guard to the full
+# CONDITION_BACKED_FLAGS handed ML_ANOMALY and ADAPTIVE_ANOMALY a veto over
+# whether R7's reference could be captured at all. A latched advisory bit
+# silently switched off a deterministic detector for the rest of the mission --
+# the exact inverse of this project's central boundary, arrived at while fixing
+# something else.
+DETERMINISTIC_CONDITION_FLAGS = CONDITION_BACKED_FLAGS & ~(
+    FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY | FaultFlag.UNKNOWN_ANOMALY
+)
+
 # Flags permitted to AUTHORISE AN AUTONOMOUS RECOVERY ACTION.
 #
 # This is a separate gate from SAFE_MODE_TRIGGER_FLAGS and must stay separate.
@@ -222,6 +235,7 @@ class FDIREngine:
         self._capability_target: Optional[CapabilitySet] = None
         self._shed_pending: set = set()
         self._degrade_attempts = 0
+        self._blocked_at_level: Optional[int] = None
         # Which rails are currently over their ceiling. Read by diagnose() to
         # name the offender rather than reporting a bare "something is hot".
         self.overcurrent_rails: set = set()
@@ -251,6 +265,15 @@ class FDIREngine:
         self._ml_breach_count = 0
         self._implausible_count = 0
         self._overcurrent_since = None
+        # Every other debounce timer is nulled here; these two were missed.
+        # _drift_since surviving meant the first post-boot out-of-band sample
+        # was compared against a timestamp from before the reset, so a single
+        # transient -- exactly what the 2 s debounce exists to forgive --
+        # latched immediately. A partial _reference_samples surviving meant a
+        # capture interrupted by a reboot resumed with samples from a different
+        # epoch mixed in.
+        self._drift_since = None
+        self._reference_samples = []
         self._imu_history.clear()
         # A reboot destroys what we knew about every condition. Evidence of
         # clearance must be re-earned by observation, not inherited.
@@ -642,7 +665,17 @@ class FDIREngine:
             # written by other detectors during the same tick, so reading them
             # here made the guard depend on call order -- which is how it came
             # to admit exactly the samples it was written to exclude.
-            if sample.bus_voltage_v < cfg.UNDERVOLTAGE_WARNING_V:
+            # Calibrated to the band the reference is LATER HELD TO, and
+            # two-sided. The old guard admitted [4.5 V, +inf): anything the
+            # undervoltage detector would not already have flagged. That
+            # admission window is wider than the +/-0.25 V tolerance the
+            # reference is measured against, so a vehicle commissioned on a
+            # partly-discharged battery at 4.55 V -- the normal post-deployment
+            # state before the panels produce -- captured 4.55 V, and then
+            # latched DRIFT the moment charging brought it to a healthy 5.00 V.
+            # There is no overvoltage detector at all, so the upper side was
+            # unbounded: 5.60 V from a mis-scaled ADC was accepted verbatim.
+            if abs(sample.bus_voltage_v - cfg.NOMINAL_VOLTAGE_V) > cfg.DRIFT_FROM_REFERENCE_V:
                 return
             # ANY ongoing condition, not just the SAFE-commanding ones. A
             # RAIL_OVERCURRENT perturbs bus voltage through I*R without
@@ -651,7 +684,7 @@ class FDIREngine:
             # nominal -- baking the fault into the number every future
             # measurement is compared against. THERMAL was blocked only by
             # accident, because it happens to carry SAFE authority.
-            if self.fault_flags & CONDITION_BACKED_FLAGS:
+            if self.fault_flags & DETERMINISTIC_CONDITION_FLAGS:
                 return
             self._reference_samples.append(sample.bus_voltage_v)
             if len(self._reference_samples) >= cfg.REFERENCE_CAPTURE_SAMPLES:
@@ -728,6 +761,8 @@ class FDIREngine:
         self._drift_since = None
         self.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
         self._clean_ticks.pop(int(FaultFlag.DRIFT_FROM_REFERENCE), None)
+        self._blocked_at_level = None
+        self._degrade_attempts = 0
         self._emit(now, "commissioning reference discarded by operator command; "
                         "recapturing from the next clean samples")
 
@@ -774,9 +809,18 @@ class FDIREngine:
             return
         if self._shed_pending:
             return              # a downgrade is already in flight
-        if (self._capability_target is not None
-                and self._degrade_attempts >= cfg.MAX_DEGRADE_ATTEMPTS):
-            return              # bounded, like every other autonomous action
+        want_now = select_level(self.fault_flags)
+        if self._blocked_at_level is not None and want_now != self._blocked_at_level:
+            # The evidence changed, so this is a NEW decision rather than a
+            # retry of the one that failed. Round 4 found that without this the
+            # bound became a permanent block: two refused sheds killed
+            # autonomous degradation for the rest of the mission, including
+            # rungs never attempted, and no operator command cleared it.
+            self._blocked_at_level = None
+            self._degrade_attempts = 0
+            self._capability_target = None
+        if self._blocked_at_level is not None:
+            return              # same evidence, already tried and refused
         # Mode must follow capability even when no flag currently argues for a
         # downgrade. After a reset the capability is restored from NVM while the
         # flags that caused it are gone, so the vehicle sat at REDUCED and
@@ -827,10 +871,27 @@ class FDIREngine:
         present -- the same evidence discipline exit_safe_mode() applies, for
         the same reason. Returns True if accepted.
         """
-        if self.capability.level == 0:
-            return True
+        # Cause first. Testing capability.level first meant that during the
+        # window between proposing a downgrade and the executor completing it,
+        # capability was still 0 and the operator got ACCEPTED without the
+        # evidence check ever running -- and the queued POWER_OFF then landed
+        # anyway, degrading the vehicle immediately after an accepted command to
+        # do the opposite.
         if select_level(self.fault_flags) > 0:
             return False
+        if self._shed_pending or self._capability_target is not None:
+            # Cancel a downgrade that has not completed, and withdraw its
+            # intents. An accepted restore must not be followed by the shed it
+            # was meant to prevent.
+            self.pending_intents = [i for i in self.pending_intents
+                                    if i.action != RecoveryAction.POWER_OFF]
+            self._shed_pending.clear()
+            self._capability_target = None
+            self._emit(now, "in-flight downgrade cancelled by operator restore")
+        self._blocked_at_level = None
+        self._degrade_attempts = 0
+        if self.capability.level == 0:
+            return True
         previous = self.capability
         for rail in rails_to_shed(LADDER[0], previous):
             self.pending_intents.append(RecoveryIntent(
@@ -1156,9 +1217,13 @@ class FDIREngine:
                             f"remains {self.capability.name} "
                             f"(attempt {self._degrade_attempts}/{cfg.MAX_DEGRADE_ATTEMPTS})")
             if self._degrade_attempts >= cfg.MAX_DEGRADE_ATTEMPTS:
-                self._emit(now, "degradation standing down; the ground is better "
-                                "placed to decide what to do with a rail that "
-                                "will not switch")
+                # Blocked for THIS evidence level only, and cleared by an
+                # operator restore or by the evidence changing.
+                self._blocked_at_level = self._capability_target.level
+                self._capability_target = None
+                self._emit(now, "degradation standing down for this condition; the "
+                                "ground is better placed to decide what to do with "
+                                "a rail that will not switch")
             return
         self._shed_pending.discard(int(rail))
         if self._shed_pending:
