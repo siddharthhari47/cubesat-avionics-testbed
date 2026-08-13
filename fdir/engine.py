@@ -83,6 +83,7 @@ CONDITION_BACKED_FLAGS = (
     FaultFlag.SENSOR_TIMEOUT | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
     | FaultFlag.SENSOR_LOCKUP | FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
     | FaultFlag.DATA_PATH_SUSPECT | FaultFlag.UNKNOWN_ANOMALY | FaultFlag.SENSOR_INVALID
+    | FaultFlag.SENSOR_IMPLAUSIBLE | FaultFlag.RAIL_OVERCURRENT
 )
 
 # Flags recording that something happened, not that something is wrong.
@@ -123,7 +124,21 @@ _UNEXPLAINED_FLAGS = FaultFlag.ADAPTIVE_ANOMALY | FaultFlag.ML_ANOMALY
 RECOVERY_AUTHORITY_FLAGS = (
     FaultFlag.COMMS_LOSS | FaultFlag.UNDERVOLTAGE_CRITICAL | FaultFlag.THERMAL_ANOMALY
     | FaultFlag.SENSOR_LOCKUP | FaultFlag.SENSOR_TIMEOUT
+    # RAIL_OVERCURRENT earns action authority because the correct response is
+    # specific, targeted and known: remove power from the offending rail. That
+    # is precisely the action KySat-2 needed and never took. It is deliberately
+    # NOT in SAFE_MODE_TRIGGER_FLAGS -- an overcurrent on one rail is a
+    # subsystem problem with a subsystem-sized answer, and letting the PAYLOAD
+    # rail safe the whole vehicle would be the wrong granularity of response.
+    | FaultFlag.RAIL_OVERCURRENT
 )
+
+# SENSOR_IMPLAUSIBLE appears in NEITHER authority set, on purpose. A channel
+# returning impossible values tells us the DATA is untrustworthy; it does not
+# tell us the spacecraft is in danger, and it does not identify a cause -- the
+# sensor, its wiring and its connector are all consistent with the evidence.
+# Acting on it would be inventing a diagnosis, which is the failure R10 exists
+# to prevent.
 
 
 @dataclass
@@ -192,6 +207,11 @@ class FDIREngine:
         self._imu_history: deque = deque(maxlen=cfg.LOCKUP_WINDOW_SAMPLES)
         self._suspect_now: set = set()
         self._invalid_now: set = set()
+        self._implausible_count = 0
+        self._overcurrent_since: Optional[float] = None
+        # Which rails are currently over their ceiling. Read by diagnose() to
+        # name the offender rather than reporting a bare "something is hot".
+        self.overcurrent_rails: set = set()
         self._ml_breach_count = 0
 
         # Consecutive non-breaching observations per fault flag. This is the
@@ -216,6 +236,8 @@ class FDIREngine:
         self._undervoltage_since = None
         self._thermal_since = None
         self._ml_breach_count = 0
+        self._implausible_count = 0
+        self._overcurrent_since = None
         self._imu_history.clear()
         # A reboot destroys what we knew about every condition. Evidence of
         # clearance must be re-earned by observation, not inherited.
@@ -268,6 +290,11 @@ class FDIREngine:
         # per-channel detectors it gates, or they will have already latched on
         # a reading the path made up.
         self._update_data_path(sample, now)
+        # Runs immediately after the path discriminator and depends on it: a
+        # device only counts as individually faulty once the shared path has
+        # been ruled out as the explanation.
+        self._update_plausibility(sample, now)
+        self._update_rail_overcurrent(sample, now)
         self._update_sensor_timeout(sample, now)
         self._update_undervoltage(sample, now)
         self._update_thermal(sample, now)
@@ -464,6 +491,85 @@ class FDIREngine:
                 self.fault_flags |= FaultFlag.DATA_PATH_SUSPECT
                 break
         self._observe(FaultFlag.DATA_PATH_SUSPECT, path_fault)
+
+    def _update_plausibility(self, sample: RawSample, now: float) -> None:
+        """
+        ONE device returning impossible values, with its bus healthy.
+
+        The single-device partner to _update_data_path, and the half that was
+        missing. `_suspect_devices()` already identified these channels -- it
+        has to, in order to count them per bus -- but a lone suspect device
+        latched nothing at all, so `sensor_corruption` came out of the scenario
+        suite as **undetected** while its two-device twin was caught cleanly.
+
+        The asymmetry was never intentional. Two devices failing together is
+        better explained by the bus they share; one device failing alone
+        genuinely is a device fault, and saying so is not the Delfi-C3 mistake,
+        it is the correct other side of that discrimination.
+
+        Deliberately silent while DATA_PATH_SUSPECT is up: a zeroed bus makes
+        every device on it look individually broken, and reporting three device
+        faults underneath a path fault would be counting one finding several
+        times over -- the same double-count diagnose()'s rule order avoids.
+        """
+        if self.mode == Mode.BOOT:
+            self._implausible_count = 0
+            return
+        suspect = getattr(self, "_suspect_now", set())
+        # Non-finite readings are SENSOR_INVALID's business, not this one.
+        suspect = suspect - sample.invalid_devices()
+        breaching = bool(suspect) and not (self.fault_flags & FaultFlag.DATA_PATH_SUSPECT)
+        self._observe(FaultFlag.SENSOR_IMPLAUSIBLE, breaching)
+        if not breaching:
+            self._implausible_count = 0
+            return
+        self._implausible_count += 1
+        for device in suspect:
+            bit = {Device.IMU: HealthFlag.IMU_OK, Device.MAG: HealthFlag.MAG_OK,
+                   Device.TEMP: HealthFlag.TEMP_OK}.get(device)
+            if bit is not None:
+                self.health_flags &= ~bit
+        if self._implausible_count >= cfg.IMPLAUSIBLE_DEBOUNCE_SAMPLES:
+            if not self.fault_flags & FaultFlag.SENSOR_IMPLAUSIBLE:
+                names = ", ".join(sorted(d.name for d in suspect))
+                self._emit(now, f"SENSOR_IMPLAUSIBLE latched ({names}) -- device-level "
+                                f"fault, its bus is not under suspicion")
+            self.fault_flags |= FaultFlag.SENSOR_IMPLAUSIBLE
+
+    def _update_rail_overcurrent(self, sample: RawSample, now: float) -> None:
+        """
+        FDIR-011. A rail drawing above its ceiling, which is where a latch-up is
+        visible LONG before any fixed voltage threshold notices.
+
+        This is the KySat-2 shape: a load ate the battery while
+        UNDERVOLTAGE_CRITICAL stayed perfectly happy until it was far too late.
+        The `rail_overcurrent` scenario exists to demonstrate exactly that gap
+        and, until now, demonstrated it by going **undetected** -- the per-rail
+        current was already in RawSample and nothing consumed it.
+
+        No evidence when rail_current_a is absent, which is not an edge case
+        but the entire point of the blinded scenario pairs: without per-rail
+        sensing this detector cannot exist, and the measured difference between
+        the sighted and blinded runs is the argument for buying the hardware.
+        """
+        if self.mode == Mode.BOOT or not sample.rail_current_a:
+            self._overcurrent_since = None
+            return
+        over = {int(r): a for r, a in sample.rail_current_a.items()
+                if a > cfg.RAIL_NOMINAL_CURRENT_CEILING_A}
+        self._observe(FaultFlag.RAIL_OVERCURRENT, bool(over))
+        self.overcurrent_rails = set(over)
+        if not over:
+            self._overcurrent_since = None
+            return
+        if self._overcurrent_since is None:
+            self._overcurrent_since = now
+        elif now - self._overcurrent_since >= cfg.RAIL_OVERCURRENT_DEBOUNCE_S:
+            if not self.fault_flags & FaultFlag.RAIL_OVERCURRENT:
+                detail = ", ".join(f"{Rail(r).name}={a:.3f} A" for r, a in sorted(over.items()))
+                self._emit(now, f"RAIL_OVERCURRENT latched ({detail}; ceiling "
+                                f"{cfg.RAIL_NOMINAL_CURRENT_CEILING_A} A)")
+            self.fault_flags |= FaultFlag.RAIL_OVERCURRENT
 
     def _channel_trusted(self, device: Device) -> bool:
         """

@@ -100,3 +100,16 @@ RAIL_NOMINAL_CURRENT_CEILING_A = 0.25
 # very requirement (FDIR-005) the guards were written to enforce. Counting
 # clean observations cannot be satisfied by erasing state.
 RESET_EVIDENCE_SAMPLES = 3
+
+# FDIR-011: how long a rail must draw above RAIL_NOMINAL_CURRENT_CEILING_A
+# before RAIL_OVERCURRENT latches. Short, because unlike a voltage sag there is
+# no benign transient that holds a rail at several times its nominal draw --
+# and because the whole point of catching this is to act before the battery is
+# gone, which is the margin KySat-2 did not have.
+RAIL_OVERCURRENT_DEBOUNCE_S = 0.5
+
+# FDIR-012: consecutive samples a single device must return implausible values
+# before SENSOR_IMPLAUSIBLE latches. Matched to LOCKUP_WINDOW_SAMPLES so that a
+# corrupt channel and a frozen one are held to the same standard of evidence --
+# a one-sample glitch is not a failed sensor.
+IMPLAUSIBLE_DEBOUNCE_SAMPLES = 5

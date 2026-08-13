@@ -48,6 +48,8 @@ class Cause(IntEnum):
     SENSOR_FROZEN = 6
     SENSOR_NOT_RESPONDING = 7
     RECOVERY_EXHAUSTED = 8
+    RAIL_OVERCURRENT = 9      # a rail is drawing above its ceiling (FDIR-011)
+    SENSOR_CORRUPT = 10       # one device, its bus fine, returning nonsense
 
 
 class Confidence(IntEnum):
@@ -123,6 +125,38 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
             f"({rail_current:.3f} A), so the radio is probably not the fault",
         )
 
+    # 2b. A rail over its ceiling outranks the undervoltage it will eventually
+    #     cause. This ordering IS the KySat-2 lesson: the drain and the sag are
+    #     one fault, and diagnosing the sag treats the symptom while the cause
+    #     keeps eating the battery. Below the COMMS_LOSS rule deliberately, so a
+    #     radio latch-up still reads as RADIO_LATCHUP rather than being
+    #     flattened into a generic overcurrent.
+    if fault_flags & FaultFlag.RAIL_OVERCURRENT:
+        over = []
+        if sample is not None and sample.rail_current_a:
+            over = [(r, a) for r, a in sorted(sample.rail_current_a.items())
+                    if a > cfg.RAIL_NOMINAL_CURRENT_CEILING_A]
+        # An overcurrent on the RADIO rail is a latch-up, and saying so does not
+        # require waiting for COMMS_LOSS to finish debouncing. The current rise
+        # is the earlier and more direct evidence -- rule 2 above reaches the
+        # same conclusion from the comms symptom, ~5 s later. Same answer, and
+        # this path gets there first.
+        radio = [(r, a) for r, a in over if r == int(Rail.RADIO)]
+        if radio:
+            return Diagnosis(
+                Cause.RADIO_LATCHUP, Confidence.LIKELY,
+                f"the radio rail is drawing {radio[0][1]:.3f} A, well above its "
+                f"nominal band -- a latch-up, caught on current before the "
+                f"comms symptom has finished debouncing",
+            )
+        detail = (", ".join(f"{Rail(r).name} at {a:.3f} A" for r, a in over)
+                  if over else "a rail above its ceiling")
+        return Diagnosis(
+            Cause.RAIL_OVERCURRENT, Confidence.LIKELY,
+            f"{detail} against a {cfg.RAIL_NOMINAL_CURRENT_CEILING_A} A nominal "
+            f"ceiling; the draw is the cause, any voltage sag is downstream of it",
+        )
+
     if fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
         return Diagnosis(Cause.POWER_UNDERVOLTAGE, Confidence.LIKELY,
                          "bus voltage below the critical threshold past its debounce")
@@ -138,6 +172,16 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
     if fault_flags & FaultFlag.SENSOR_TIMEOUT:
         return Diagnosis(Cause.SENSOR_NOT_RESPONDING, Confidence.LIKELY,
                          "sensor produced no fresh reading past its debounce")
+
+    # The single-device partner to rule 1. Reached only when DATA_PATH_SUSPECT
+    # is absent, which is what makes it a claim about the DEVICE: the bus it
+    # sits on is carrying its neighbours' traffic perfectly well.
+    if fault_flags & FaultFlag.SENSOR_IMPLAUSIBLE:
+        return Diagnosis(
+            Cause.SENSOR_CORRUPT, Confidence.LIKELY,
+            "one device is returning physically impossible values while the bus "
+            "it shares is healthy, so the device is the better explanation",
+        )
 
     if fault_flags & FaultFlag.RECOVERY_FAILED:
         return Diagnosis(Cause.RECOVERY_EXHAUSTED, Confidence.LIKELY,

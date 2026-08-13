@@ -196,7 +196,18 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
         r.outcome = Outcome.UNDETECTED
     elif r.recovery_verified:
         r.outcome = Outcome.RECOVERED
-    elif h.engine.fault_flags & FaultFlag.UNKNOWN_ANOMALY:
+    elif (h.engine.fault_flags & FaultFlag.UNKNOWN_ANOMALY
+          and h.engine.diagnosis.cause == Cause.UNKNOWN):
+        # BOTH conditions, not just the flag. UNKNOWN_ANOMALY latches, so
+        # testing it alone labels a whole run by a moment: the rail-overcurrent
+        # scenario briefly had an advisory signal it could not yet explain
+        # (before the 0.5 s current debounce elapsed), latched the flag, then
+        # correctly identified the cause -- and was still being reported as
+        # "unknown_held" at the end on the strength of that transient.
+        #
+        # unknown_held has to mean "we still do not know", which is a statement
+        # about the FINAL state. Same latching-flag-read-as-live-state mistake
+        # the safety review kept turning up.
         r.outcome = Outcome.UNKNOWN_HELD
     elif h.engine.fault_flags & FaultFlag.RECOVERY_FAILED or h.engine.mode == Mode.SAFE:
         r.outcome = Outcome.CONTAINED
@@ -225,7 +236,8 @@ def build_suite() -> List[Scenario]:
         # Same presenting symptom (comms dead). Different cause, different
         # correct action. Separable only by per-rail current.
         Scenario("radio latch-up (per-rail sensing)", "radio_latchup",
-                 expect_flags=int(FaultFlag.COMMS_LOSS), expect_cause=Cause.RADIO_LATCHUP,
+                 expect_flags=int(FaultFlag.COMMS_LOSS | FaultFlag.RAIL_OVERCURRENT),
+                 expect_cause=Cause.RADIO_LATCHUP,
                  seed=11, duration_s=180.0,
                  note="CSSWE mechanism; recoverable by power removal"),
         Scenario("radio unresponsive (per-rail sensing)", "radio_unresponsive",
@@ -237,7 +249,8 @@ def build_suite() -> List[Scenario]:
         # Identical scenarios with per-rail sensing removed. The difference
         # between these two rows and the two above is the purchase argument.
         Scenario("radio latch-up (NO per-rail sensing)", "radio_latchup",
-                 expect_flags=int(FaultFlag.COMMS_LOSS), expect_cause=Cause.RADIO_LATCHUP,
+                 expect_flags=int(FaultFlag.COMMS_LOSS | FaultFlag.RAIL_OVERCURRENT),
+                 expect_cause=Cause.RADIO_LATCHUP,
                  seed=11, duration_s=180.0, per_rail_sensing=False,
                  note="same fault, aggregate bus current only"),
         Scenario("radio unresponsive (NO per-rail sensing)", "radio_unresponsive",
@@ -254,29 +267,40 @@ def build_suite() -> List[Scenario]:
                  seed=21, duration_s=60.0,
                  note="Delfi-C3: the path failed, the devices are fine"),
         Scenario("single sensor corrupt", "sensor_corruption",
-                 expect_flags=0, forbid_flags=int(FaultFlag.DATA_PATH_SUSPECT),
+                 expect_flags=int(FaultFlag.SENSOR_IMPLAUSIBLE),
+                 expect_cause=Cause.SENSOR_CORRUPT,
+                 forbid_flags=int(FaultFlag.DATA_PATH_SUSPECT),
                  seed=22, duration_s=60.0,
-                 note="control: one device is not evidence of a path fault"),
+                 note="one device is a DEVICE fault, and must not read as a path fault"),
 
         # -- KySat-2 -------------------------------------------------------
         Scenario("recovery that cannot succeed", "radio_latchup",
-                 expect_flags=int(FaultFlag.COMMS_LOSS), expect_cause=Cause.RADIO_LATCHUP,
+                 expect_flags=int(FaultFlag.COMMS_LOSS | FaultFlag.RAIL_OVERCURRENT),
+                 expect_cause=Cause.RADIO_LATCHUP,
                  seed=31, latch_clears=False, duration_s=200.0,
                  note="KySat-2: action executes correctly and achieves nothing"),
         Scenario("OBC reset mid-recovery", "radio_latchup",
-                 expect_flags=int(FaultFlag.COMMS_LOSS), expect_cause=Cause.RADIO_LATCHUP,
+                 expect_flags=int(FaultFlag.COMMS_LOSS | FaultFlag.RAIL_OVERCURRENT),
+                 expect_cause=Cause.RADIO_LATCHUP,
                  seed=32, latch_clears=False, duration_s=200.0, obc_reset_at_s=45.0,
                  note="KySat-2: the reset must not restart the ladder"),
 
         # -- power ---------------------------------------------------------
-        # Expected to be UNDETECTED, and that is the finding, not a bug: there
-        # is no overcurrent detector, and the KySat-2 mechanism is precisely
-        # that a rail can eat the battery while every fixed voltage threshold
-        # stays satisfied. Asserting a flag here would have papered over the
-        # gap the case study says killed that spacecraft.
-        Scenario("rail overcurrent (no detector exists)", "rail_overcurrent",
-                 expect_flags=0, seed=41, duration_s=120.0,
-                 note="KySat-2 drain: voltage stays legal while the battery empties"),
+        # This scenario used to expect UNDETECTED, and that was the honest
+        # finding at the time: no overcurrent detector existed, and the KySat-2
+        # mechanism is precisely that a rail can eat the battery while every
+        # fixed VOLTAGE threshold stays satisfied.
+        #
+        # FDIR-011 closes it. The assertion is now inverted, and the forbid on
+        # UNDERVOLTAGE_CRITICAL is the load-bearing half: catching this as a
+        # voltage problem would mean catching it far too late, which is the
+        # whole failure. It must be caught on CURRENT, before the sag.
+        Scenario("rail overcurrent", "rail_overcurrent",
+                 expect_flags=int(FaultFlag.RAIL_OVERCURRENT),
+                 expect_cause=Cause.RAIL_OVERCURRENT,
+                 forbid_flags=int(FaultFlag.UNDERVOLTAGE_CRITICAL),
+                 seed=41, duration_s=120.0,
+                 note="KySat-2 drain: caught on CURRENT, before any voltage threshold moves"),
         Scenario("undervoltage", "undervoltage",
                  expect_flags=int(FaultFlag.UNDERVOLTAGE_CRITICAL),
                  expect_cause=Cause.POWER_UNDERVOLTAGE, seed=42, duration_s=60.0),

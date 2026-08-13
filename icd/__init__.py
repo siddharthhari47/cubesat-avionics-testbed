@@ -163,6 +163,19 @@ class FaultFlag(IntFlag):
     # inventing a specific fault from a broken channel is the wrong-diagnosis
     # failure this project exists to avoid (R10).
     SENSOR_INVALID = 1 << 13
+    # One device is returning finite but physically impossible readings while
+    # its bus is fine. Distinct from SENSOR_INVALID (not a number at all) and
+    # from DATA_PATH_SUSPECT (the shared path, not the device). This is the
+    # single-device partner to the Delfi-C3 case: two devices failing together
+    # is better explained by their bus, but ONE device failing alone genuinely
+    # is a device fault, and until now nothing latched for it at all.
+    SENSOR_IMPLAUSIBLE = 1 << 14
+    # A switchable rail is drawing above its ceiling. KySat-2 lost its battery
+    # to exactly this while every fixed VOLTAGE threshold stayed happy -- the
+    # current is where the fault is visible, and the per-rail sensing that
+    # makes it visible is the one hardware capability the failure research put
+    # a purchase deadline on.
+    RAIL_OVERCURRENT = 1 << 15
 
 
 class HealthFlag(IntFlag):

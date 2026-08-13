@@ -18,17 +18,43 @@ handled. A working demo backed by engineering evidence — not just a working de
 
 ## Current state
 
-**Phase: V0, Week 1.** Repository skeleton exists. No hardware purchased. No firmware
-written. Immediate deliverables in order:
+**Phase: V0 complete, pre-hardware.** All six original V0 deliverables are done —
+mission statement, SRS, block and mode diagrams, telemetry/command dictionaries,
+simulator and ground station. Hardware is ordered and has not arrived, so no firmware
+is written and nothing here has run on a real board.
 
-1. Mission statement (one paragraph, plain language) → README
-2. 15–25 system requirements with IDs → `docs/requirements/`
-3. Top-level block diagram → `docs/architecture/`
-4. Operating modes and state-transition diagram (BOOT, NOMINAL, SAFE, TEST)
-5. Telemetry dictionary → `docs/interfaces/`
-6. V0 Python telemetry simulator + basic ground station dashboard
+Built since, in order (`docs/architecture/v0-gap-analysis-and-plan.md` is the plan
+these follow):
 
-Hardware is ordered only after V0 works.
+- `fdir/` — a hardware-agnostic decision engine. `FDIREngine.tick()` is a pure
+  function of state; it holds no sockets, threads, or ports.
+- Deterministic detectors with debounced, latching flags, each traced to an SRS ID.
+- `fdir/diagnosis.py` — symptom → cause, with `UNKNOWN` as a first-class answer.
+- `fdir/recovery.py` + `executor.py` — bounded, verified, escalating recovery
+  campaigns whose state survives a reset.
+- `simulator/environment.py` — a physical state model (rails, battery, thermal
+  nodes, bus topology). Signals are derived from state, never scripted.
+- `scenarios/runner.py` — 15 fault-injection scenarios including blinded
+  discrimination pairs, with negative assertions that gate the build.
+- ML #1 as an advisory anomaly detector, streaming, with an exported C header.
+- Ground-station event timeline that renders flags by what authority they carry.
+
+**306 tests.** Two adversarial safety-review rounds are complete
+(`docs/architecture/v0-adversarial-safety-review.md`): ten findings, all fixed.
+
+**The governing principle, and it is enforced in code rather than described:**
+ML detects. FDIR decides. Recovery executes. FDIR verifies. Hardware safety
+constrains everything. `ML_ANOMALY` and `ADAPTIVE_ANOMALY` appear in neither
+`SAFE_MODE_TRIGGER_FLAGS` nor `RECOVERY_AUTHORITY_FLAGS`, and tests fail if either
+bit is ever added.
+
+**What is deliberately not built:** ML #2 (the case study concludes it is not
+justified on current evidence — a clean interface seam exists and nothing more),
+fixed-reference drift detection (R7), and degraded modes (R8). All three are
+recorded in `docs/requirements/case-study-traceability.md` with what would close
+them. Do not quietly implement them without revisiting that reasoning.
+
+Next milestone is V1, which is blocked on hardware arriving.
 
 ## Engineering phases
 
@@ -109,12 +135,25 @@ data/               Captured telemetry logs
 media/              Photos, demo video
 ```
 
-## Planned hardware (not yet purchased)
+## Hardware (ordered, not yet arrived)
 
 STM32 Nucleo-class board · ICM-20948-class IMU · LIS3MDL-class magnetometer ·
 digital temperature sensor · INA219/INA226 power monitor · SPI microSD module ·
 USB-UART adapter (3.3 V) · logic analyzer · multimeter. Wireless module and battery
 system selected only after V1 is validated.
+
+The power monitor is the one part with a measured justification rather than an
+assumed one. Same fault, same seed, differing only in whether per-rail current is
+available to the FDIR layer:
+
+| | Detection | Diagnosis |
+|---|---|---|
+| radio latch-up, **with** per-rail current | 0.70 s | `RADIO_LATCHUP` ✅ |
+| radio latch-up, **without** | 5.10 s | `GROUND_LINK_LOST` ❌ |
+
+7× faster and correct, versus slow and wrong. `docs/architecture/v0-scenario-results.md`
+has the run. Keep the blinded halves of those scenario pairs — they are what makes
+this a measurement rather than an assertion.
 
 ## Software stack
 

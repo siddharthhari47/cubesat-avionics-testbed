@@ -25,15 +25,15 @@ understand well enough to model, what does the architecture actually do about it
 | Scenario | Detected | Latency (s) | Diagnosis | Correct | Outcome | Actions |
 |---|---|---|---|---|---|---|
 | nominal control | no | — | — | — | **clean** | 0 |
-| radio latch-up *(per-rail sensing)* | yes | 5.10 | `RADIO_LATCHUP` | ✅ | recovered | 2 |
+| radio latch-up *(per-rail sensing)* | yes | **0.70** | `RADIO_LATCHUP` | ✅ | recovered | 2 |
 | radio unresponsive *(per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
 | radio latch-up *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ❌ | recovered | 2 |
 | radio unresponsive *(**no** per-rail sensing)* | yes | 5.10 | `GROUND_LINK_LOST` | ✅ | contained | 4 |
 | data bus failure | yes | 0.10 | `DATA_PATH` | ✅ | detected_only | 0 |
-| single sensor corrupt | **no** | — | — | — | undetected | 0 |
-| recovery that cannot succeed | yes | 5.10 | `RADIO_LATCHUP` | ✅ | contained | 4 |
-| OBC reset mid-recovery | yes | 5.10 | `RADIO_LATCHUP` | ✅ | contained | 8 |
-| rail overcurrent | **no** | — | `THERMAL` | — | undetected | 0 |
+| single sensor corrupt | yes | **0.50** | `SENSOR_CORRUPT` | ✅ | detected_only | 0 |
+| recovery that cannot succeed | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 4 |
+| OBC reset mid-recovery | yes | **0.70** | `RADIO_LATCHUP` | ✅ | contained | 8 |
+| rail overcurrent | yes | **0.70** | `RAIL_OVERCURRENT` | ✅ | contained | 0 |
 | undervoltage | yes | 0.30 | `POWER_UNDERVOLTAGE` | ✅ | contained | 0 |
 | thermal excursion | yes | 0.40 | `THERMAL` | ✅ | contained | 0 |
 | sensor frozen | yes | 0.50 | `SENSOR_FROZEN` | ✅ | contained | 0 |
@@ -58,13 +58,38 @@ had never been made to prove it. Non-comms latencies (undervoltage 0.30,
 thermal 0.40, lockup 0.50, sensor timeout 0.20, data bus 0.10) are unchanged,
 as are every outcome and the whole negative-assertion column.
 
+**Two detectors added, 2026-08-12 (FDIR-011, FDIR-012).** `single sensor corrupt`
+and `rail overcurrent` had both been reported here as **undetected** for several
+phases, and in each case that was the honest state: the data the detector needed was
+already in `RawSample` and nothing consumed it. Both now detect and diagnose
+correctly, and **undetected falls from 3/14 to 1/14** — only `gradual drift` remains,
+which is R7 and deliberately out of V0 scope.
+
+The `rail overcurrent` row carries a forbid on `UNDERVOLTAGE_CRITICAL`, and that is
+the load-bearing half of the assertion: catching this as a voltage problem means
+catching it after the battery has drained, which is the KySat-2 failure rather than a
+fix for it. It must be caught on current, before the sag.
+
+**The sharpest result is the latch-up pair.** Both halves now assert the same flags,
+so the measured difference isolates exactly one variable — whether per-rail current
+sensing exists:
+
+| | Detection | Diagnosis |
+|---|---|---|
+| radio latch-up, **with** per-rail current | **0.70 s** | `RADIO_LATCHUP` ✅ |
+| radio latch-up, **without** per-rail current | 5.10 s | `GROUND_LINK_LOST` ❌ |
+
+7× faster and correct, versus slow and wrong. That is the argument for the INA219/226
+on the hardware shortlist, stated as a measurement rather than an opinion — and it is
+the one number this suite produces that directly justifies a purchase.
+
 **Negative assertions: all clean.** No forbidden flag latched; no forbidden
 action fired. This matters more than the positive column — four of five
 documented FDIR failures were wrong-action failures, and a suite with only
 positive assertions cannot catch those.
 
-**Outcome distribution (n=14 injected faults):** recovered 2, contained 7,
-detected-only 2, undetected 3, unknown-held 0.
+**Outcome distribution (n=14 injected faults):** recovered 2, contained 8,
+detected-only 3, undetected 1, unknown-held 0.
 
 ---
 
@@ -91,32 +116,36 @@ selects the action rather than merely annotating it, which is the natural next
 step. Reporting this as "sensing doesn't matter, we recovered anyway" would be
 reading the table backwards.
 
-## Finding 2 — a fault diagnosed by its consequence, not its cause
+## Finding 2 — a fault diagnosed by its consequence, not its cause *(CLOSED)*
 
-`rail_overcurrent` is **undetected**, and the diagnosis layer reports `THERMAL`.
+**This finding is resolved. It is kept because how it was resolved is the point.**
 
-Both halves are real:
+`rail_overcurrent` used to be **undetected**, with the diagnosis layer confidently
+reporting `THERMAL`. Both halves were real. Undetected was the honest state — no
+overcurrent detector existed, and the KySat-2 mechanism is precisely that a rail
+drains the battery while every fixed voltage threshold stays satisfied (measured in
+Phase 2: 1.55 A draw at 4.85 V, above both thresholds). The `THERMAL` diagnosis was a
+genuine defect: the extra current heats the structure node, the thermal detector fires
+on the *consequence*, and the diagnosis layer named it — while the actual cause went
+unnamed. A smaller cousin of Delfi-C3: a correct detector firing on a real symptom
+that is not the root cause.
 
-- **Undetected is correct and expected.** There is no overcurrent detector, and
-  the KySat-2 mechanism is precisely that a rail can drain the battery while
-  every fixed voltage threshold stays satisfied (measured in Phase 2: 1.55 A
-  draw at 4.85 V, above both thresholds). Asserting a flag here would have
-  papered over the gap the case study attributes that spacecraft's loss to.
-- **The `THERMAL` diagnosis is a genuine defect.** The extra current heats the
-  structure node, the thermal detector fires on the *consequence*, and the
-  diagnosis layer confidently names it — while the actual cause goes unnamed.
-  This is a smaller cousin of the Delfi-C3 problem: a correct detector firing
-  on a real symptom that is not the root cause.
+FDIR-011 closes both. Detection at **0.70 s** on rail current, diagnosis
+`RAIL_OVERCURRENT`, and the rule sits **above** `UNDERVOLTAGE_CRITICAL` in
+`diagnose()` — because the drain and the sag are one fault, and diagnosing the sag
+treats a symptom while the cause keeps draining. The scenario now forbids
+`UNDERVOLTAGE_CRITICAL` outright: being caught on voltage would mean being caught too
+late, which is the failure rather than a fix for it.
 
-**Both point at the same missing piece: an overcurrent detector on per-rail
-current.** That is a software change, but it only works if the hardware provides
-the channel — which ties back to Finding 1.
+Note what did **not** change: the detector requires per-rail current, so it cannot
+exist on the blinded runs. Finding 1's argument is unaffected and, if anything,
+stronger.
 
 ## Finding 3 — gaps the suite exposes rather than hides
 
 | Gap | Why it is undetected | Honest status |
 |---|---|---|
-| `single sensor corrupt` | No per-channel plausibility check exists for the magnetometer. A single device returning zeros is caught only when it is part of a *bus-wide* pattern. | Real gap. Needs a per-channel range/consistency check. |
+| ~~`single sensor corrupt`~~ | ~~No per-channel plausibility check exists.~~ | **CLOSED** by FDIR-012. Detected at 0.50 s, diagnosed `SENSOR_CORRUPT`, and still correctly *not* a path fault. The signal was always there — `_suspect_devices()` had to identify the channel in order to count devices per bus — but a lone suspect device latched nothing. The asymmetry was never intentional. |
 | `gradual_drift` | The EWMA adaptive baseline absorbs slow change as the new normal — measured at 0% recall in the ML evaluation, and the flight analogue is QuakeSat. | Known and previously documented. R7 (fixed-reference trending) is the fix and is not built. |
 | `unknown_held` = 0 | No scenario produced an UNKNOWN diagnosis, because the only detectors that yield one (adaptive/ML) did not fire in any scenario. | The R10 path is implemented and unit-tested but **not exercised end-to-end by any scenario.** Worth adding a scenario that genuinely defeats every enumerated rule. |
 
@@ -133,7 +162,7 @@ the channel — which ties back to Finding 1.
 
 ## What "contained" means here, and why it dominates
 
-Seven of fourteen outcomes are `contained` rather than `recovered`. That is not a
+Eight of fourteen outcomes are `contained` rather than `recovered`. That is not a
 disappointing result — it is the expected one, and it matches the case study:
 most documented spacecraft outcomes were containment or degraded operation, not
 repair. `contained` means the fault was detected, correctly diagnosed, and the

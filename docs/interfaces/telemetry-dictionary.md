@@ -77,7 +77,9 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 | 11 | Data-path suspect: 2+ devices on one bus invalid together | R6 |
 | 12 | Unknown anomaly: no enumerated diagnosis matches | R10 |
 | 13 | Sensor invalid: a channel returned a non-finite value (NaN/inf) | F3 |
-| 14-31 | Reserved | — |
+| 14 | Sensor implausible: one device returning impossible values, its bus healthy | FDIR-012 |
+| 15 | Rail overcurrent: a switchable rail above its nominal ceiling | FDIR-011 |
+| 16-31 | Reserved | — |
 
 **On bit 13.** Added after the V0 adversarial safety review. Every comparison
 with NaN is False in both Python and C, so a NaN reading silently satisfied or
@@ -92,6 +94,18 @@ It carries **neither SAFE-mode nor recovery authority**: an invalid reading mean
 the sensor is untrustworthy, not that the spacecraft is in danger, and inventing a
 specific fault out of a broken channel is the wrong-diagnosis failure R10 exists
 to prevent. Clearable via `RESET_FAULTS` on the usual positive evidence.
+
+**On bits 14 and 15.** Bit 14 is the single-device partner to bit 11: two devices on
+one bus failing together is better explained by the bus, but *one* device failing
+alone genuinely is a device fault, and nothing latched for that case until now. Like
+bit 13 it carries no authority — the sensor, its wiring and its connector all fit the
+evidence equally, so acting would mean inventing a diagnosis.
+
+Bit 15 is the KySat-2 bit. That spacecraft lost its battery to a rail that kept
+drawing while every fixed *voltage* threshold stayed satisfied; the current is where
+the fault is visible first. It **does** carry recovery authority, because the correct
+response is specific and known (remove power from that rail), but deliberately not
+SAFE-mode authority — a payload rail must not be able to safe the whole vehicle.
 
 ## Health Flag Bits (offset 13, uint16 bitmask)
 

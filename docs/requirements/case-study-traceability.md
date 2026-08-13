@@ -311,8 +311,6 @@ What that does and does not prove:
 | No scenario drives the UNKNOWN path end-to-end | R10 | Traces to 63% of the dataset — the largest bucket, least demonstrated |
 | No fixed-reference drift detection | R7 | Adaptive-only baselines learn slow drift as normal |
 | No degraded modes | R8 | Response granularity is still the whole vehicle |
-| No overcurrent detector on per-rail current | — | The data exists in `RawSample`; nothing consumes it as a detector |
-| No per-channel plausibility check | — | Single-device corruption is currently undetectable |
 | No independent adversarial pass over the review's own conclusions | — | Both review rounds were one reviewer auditing their own code; 3 of 10 findings only surfaced because fixing something else disturbed them |
 
 *(The adversarial safety review itself is done — two rounds, ten findings, all fixed.
