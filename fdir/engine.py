@@ -236,6 +236,7 @@ class FDIREngine:
         self._shed_pending: set = set()
         self._degrade_attempts = 0
         self._blocked_at_level: Optional[int] = None
+        self._restore_pending: set = set()
         # Which rails are currently over their ceiling. Read by diagnose() to
         # name the offender rather than reporting a bare "something is hot".
         self.overcurrent_rails: set = set()
@@ -871,6 +872,19 @@ class FDIREngine:
         present -- the same evidence discipline exit_safe_mode() applies, for
         the same reason. Returns True if accepted.
         """
+        # R5-4. SAFE first, and checked against SAFE_MODE_TRIGGER_FLAGS
+        # specifically. _update_degraded_mode already refuses to touch
+        # capability in SAFE -- "if something can command SAFE the mission is
+        # not currently viable" -- and this method had no equivalent guard. Its
+        # only gate was select_level(), computed from DEGRADE_TRIGGERS, a set
+        # DISJOINT from the SAFE triggers. So select_level() reads 0 in exactly
+        # the state where the vehicle is least able to carry load, and the
+        # ground could add payload draw during an undervoltage-critical SAFE and
+        # be told ACCEPTED. The docstring claimed the same evidence discipline
+        # as exit_safe_mode(); it was checking an entirely different set.
+        if self.mode == Mode.SAFE or (self.fault_flags & SAFE_MODE_TRIGGER_FLAGS):
+            return False
+
         # Cause first. Testing capability.level first meant that during the
         # window between proposing a downgrade and the executor completing it,
         # capability was still 0 and the operator got ACCEPTED without the
@@ -892,19 +906,58 @@ class FDIREngine:
         self._degrade_attempts = 0
         if self.capability.level == 0:
             return True
-        previous = self.capability
-        for rail in rails_to_shed(LADDER[0], previous):
+        # R5-3. TWO-PHASE, like the downgrade. Round 4 moved the downgrade to
+        # "the engine proposes, the executor acts" and left this direction as it
+        # was, so this wrote capability = FULL and mode = NOMINAL immediately. A
+        # load switch that fails open therefore left the rail dead while the
+        # engine reported full capability -- and once this became telecommand
+        # 0x0B, the operator was told ACCEPTED for a restore that never happened.
+        #
+        # The command IS accepted here: it is a legitimate request and the
+        # intents are queued. Capability advances in note_restore_completed(),
+        # once the rails are confirmed back.
+        pending = rails_to_shed(LADDER[0], self.capability)
+        for rail in pending:
             self.pending_intents.append(RecoveryIntent(
                 action=RecoveryAction.POWER_ON, target=Rail(rail),
-                reason=f"restore {previous.name} -> FULL: re-powering {Rail(rail).name}",
+                reason=f"restore {self.capability.name} -> FULL: "
+                       f"re-powering {Rail(rail).name}",
                 requested_at=now,
             ))
+        self._restore_pending = set(int(r) for r in pending)
+        self._emit(now, f"capability restore accepted ({self.capability.name} -> FULL); "
+                        f"re-powering {[Rail(r).name for r in pending]}")
+        if not pending:
+            self.capability = LADDER[0]
+            if self.mode == Mode.DEGRADED:
+                self.mode = Mode.NOMINAL
+        return True
+
+    def note_restore_completed(self, now: float, rail: int, accepted: bool) -> None:
+        """
+        The executor reporting whether a rail actually came back.
+
+        Capability advances here and nowhere else on the way up, for the same
+        reason it advances only in note_shed_completed() on the way down: a
+        command that was issued is not a configuration that was achieved.
+        """
+        if not self._restore_pending:
+            return
+        if not accepted:
+            self._restore_pending.clear()
+            self._emit(now, f"capability restore FAILED: port refused to re-power "
+                            f"{Rail(rail).name}; capability remains "
+                            f"{self.capability.name}")
+            return
+        self._restore_pending.discard(int(rail))
+        if self._restore_pending:
+            return
+        previous = self.capability
         self.capability = LADDER[0]
         if self.mode == Mode.DEGRADED:
             self.mode = Mode.NOMINAL
-        self._emit(now, f"capability restored by operator command "
+        self._emit(now, f"capability restored and confirmed "
                         f"({previous.name} -> {self.capability.name})")
-        return True
 
     def _channel_trusted(self, device: Device) -> bool:
         """
@@ -1211,10 +1264,25 @@ class FDIREngine:
         if not self._shed_pending or self._capability_target is None:
             return
         if not accepted:
+            # ROLL BACK the rails that DID switch. A partial shed leaves the
+            # vehicle in a configuration no capability set describes, and the
+            # premise of R8 is that it only ever operates in a validated one.
+            # Worse, the engine kept reporting FULL/NOMINAL while two of three
+            # rails were physically off -- and it is the engine's claim, not the
+            # truth, that reaches the ground in the telemetry packet.
+            already_shed = [r for r in rails_to_shed(self.capability, self._capability_target)
+                            if r not in self._shed_pending and int(r) != int(rail)]
+            for r in already_shed:
+                self.pending_intents.append(RecoveryIntent(
+                    action=RecoveryAction.POWER_ON, target=Rail(r),
+                    reason=f"roll back partial degrade: re-powering {Rail(r).name}",
+                    requested_at=now,
+                ))
             self._shed_pending.clear()
+            rolled = f", rolling back {[Rail(r).name for r in already_shed]}" if already_shed else ""
             self._emit(now, f"degrade to {self._capability_target.name} FAILED: "
                             f"port refused to shed {Rail(rail).name}; capability "
-                            f"remains {self.capability.name} "
+                            f"remains {self.capability.name}{rolled} "
                             f"(attempt {self._degrade_attempts}/{cfg.MAX_DEGRADE_ATTEMPTS})")
             if self._degrade_attempts >= cfg.MAX_DEGRADE_ATTEMPTS:
                 # Blocked for THIS evidence level only, and cleared by an

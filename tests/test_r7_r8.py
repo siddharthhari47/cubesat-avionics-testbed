@@ -340,11 +340,21 @@ def test_degrading_does_not_upgrade_itself_when_the_flag_clears():
 
 
 def test_an_operator_can_restore_capability_once_the_condition_clears():
-    e, t, _ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
+    e, t, ex, _p = degraded_engine(FaultFlag.DRIFT_FROM_REFERENCE)
     assert e.restore_capability(t) is False, "refused while the cause is present"
 
     e.fault_flags &= ~FaultFlag.DRIFT_FROM_REFERENCE
-    assert e.restore_capability(t) is True
+    assert e.restore_capability(t) is True, "the command is accepted"
+
+    # But capability does NOT advance until the rails are confirmed back --
+    # the same two-phase rule the downgrade obeys. Round 5 found the restore
+    # direction still committing optimistically, so a load switch that failed
+    # open left the rail dead while the engine reported FULL.
+    assert e.capability is REDUCED, "not until the executor confirms"
+    for i in range(5):
+        e.tick(sample(i), t)
+        ex.step(e, t)
+        t += 0.1
     assert e.capability is FULL
     assert e.mode == Mode.NOMINAL
 

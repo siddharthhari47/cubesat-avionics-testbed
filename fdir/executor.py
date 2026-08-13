@@ -73,7 +73,7 @@ class RecoveryExecutor:
                     intent=intent, started_at=now, completed_at=now, accepted=False,
                     detail="refused: another recovery action is already in progress",
                 ))
-                engine.note_action_completed(now, accepted=False)
+                self._report(engine, intent, now, accepted=False)
                 continue
             self._begin(engine, intent, now)
 
@@ -86,7 +86,7 @@ class RecoveryExecutor:
                 record.completed_at = now
                 record.detail = "power-off command refused by port"
                 self.history.append(record)
-                engine.note_action_completed(now, accepted=False)
+                self._report(engine, intent, now, accepted=False)
                 return
             record.detail = "powered off, waiting out dwell"
             self._in_flight = _PendingCycle(intent=intent, powered_off_at=now, record=record)
@@ -107,10 +107,7 @@ class RecoveryExecutor:
             # recovery campaign -- they are different decisions with different
             # bookkeeping, and routing a shed through note_action_completed
             # would advance a campaign that never issued it.
-            if intent.action == RecoveryAction.POWER_OFF:
-                engine.note_shed_completed(now, intent.target, ok)
-            else:
-                engine.note_action_completed(now, accepted=ok)
+            self._report(engine, intent, now, ok)
             return
 
         if intent.action == RecoveryAction.RESET_DEVICE:
@@ -130,14 +127,35 @@ class RecoveryExecutor:
             record.completed_at = now
             record.detail = "device reset issued" if ok else "device reset unavailable"
             self.history.append(record)
-            engine.note_action_completed(now, accepted=ok)
+            self._report(engine, intent, now, ok)
             return
 
         record.accepted = False
         record.completed_at = now
         record.detail = f"unsupported action {intent.action!r}"
         self.history.append(record)
-        engine.note_action_completed(now, accepted=False)
+        self._report(engine, intent, now, accepted=False)
+
+    def _report(self, engine, intent: RecoveryIntent, now: float, accepted: bool) -> None:
+        """
+        Tell the RIGHT state machine that an action finished.
+
+        Exactly one place decides this, and that is the fix. The routing was
+        added in _begin() only, so the busy branch of step() still sent every
+        refused intent to the recovery campaign -- including load sheds. A
+        POWER_OFF proposed while a comms-recovery power cycle was in its
+        off-dwell therefore reported to the campaign, `_shed_pending` was never
+        cleared, and `_update_degraded_mode` returned on its first line for the
+        rest of the mission. R8 autonomy died silently, with no attempt counted
+        and no stand-down logged, and the campaign it collided with was handed a
+        completion it never issued.
+        """
+        if intent.action == RecoveryAction.POWER_OFF:
+            engine.note_shed_completed(now, intent.target, accepted)
+        elif intent.action == RecoveryAction.POWER_ON:
+            engine.note_restore_completed(now, intent.target, accepted)
+        else:
+            engine.note_action_completed(now, accepted=accepted)
 
     def _advance_in_flight(self, engine, now: float) -> None:
         cycle = self._in_flight
@@ -154,11 +172,12 @@ class RecoveryExecutor:
             if ok else "power-on command refused by port"
         )
         self.history.append(cycle.record)
+        completed = cycle.intent
         self._in_flight = None
         # Report completion, NOT success. Whether the fault actually cleared is
         # re-observed from telemetry by the engine's verification window -- the
         # port accepting a command is not evidence of anything.
-        engine.note_action_completed(now, accepted=ok)
+        self._report(engine, completed, now, ok)
 
     # ---- reporting ---------------------------------------------------------
 

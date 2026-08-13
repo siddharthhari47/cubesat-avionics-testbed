@@ -28,6 +28,11 @@ states plainly what this review is and is not.
 > outside look" -- it is that a fix is a code change like any other, and this project
 > has been verifying fixes against the defect they targeted and not against what they
 > broke.
+>
+> **ROUND 5 (§10) went 4 for 4: every finding was in code that was itself a fix.** The
+> four share one shape -- a fix applied where the author looked and absent where they did
+> not: one branch of two, total failure but not partial, one direction of a symmetric
+> pair, one entry point of two. Twenty-nine findings, all fixed, **386 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -779,9 +784,45 @@ Each fix was verified against the defect it targeted. None was checked for what 
 
 ---
 
-### Standing after four rounds
+---
 
-**Twenty-four findings across four rounds, all twenty-four fixed.** Suite: 249 → **375
+## 10. Round 5 -- four for four, all in fixes
+
+Round 4's lesson was that fixes here have a high defect rate. Round 5 tested it:
+**4 findings, 4 of them in code that was itself a repair.**
+
+| # | Severity | Defect | Shape |
+|---|---|---|---|
+| R5-1 | **CRITICAL** | A shed refused while the executor was busy reported to the recovery campaign, not the capability machine. `_shed_pending` never cleared, so R8 autonomy died for the mission -- silently, with no attempt counted and no stand-down logged | fix applied in **one branch and not the other** |
+| R5-2 | HIGH | A partially refused multi-rail shed left rails physically off while the engine reported FULL/NOMINAL, permanently | two-phase commit handling **total failure but not partial** |
+| R5-3 | HIGH | `restore_capability()` committed FULL before the executor confirmed the POWER_ON, and telecommand 0x0B returned ACCEPTED off it | rule applied to **one direction** of a symmetric operation |
+| R5-4 | MEDIUM | Restore accepted in SAFE, re-powering rails during a critical undervoltage | guard on **one entry point and not the one beside it** |
+
+Every one is the same sentence: *the fix was correct where I looked and absent where I
+did not.* R5-1 is the sharpest -- round 4 split shed reporting from campaign reporting
+inside `_begin()`, and the busy branch of `step()` fifteen lines above kept the old
+routing. One branch fixed, one not, and the consequence was silent permanent loss of a
+whole subsystem's autonomy.
+
+The structural answer, rather than four more point fixes: completions now route through
+a **single** `_report()` method, and a test asserts there are exactly three direct calls
+in the file so a future branch cannot route one wrongly again. `restore_capability()` is
+two-phase like the downgrade, and a partial shed **rolls back** rather than leaving the
+vehicle in a configuration no capability set describes.
+
+### On method
+
+This round used **one agent**, not four. Rounds 3 and 4 spent ~800k tokens each and got
+2-of-15 and 1-of-4 agents through the spend limit; round 5 spent **160k** and got 1-of-1.
+The limit kills the fan-out, not the individual agent, so concentrating the budget on the
+single highest-yield lens is strictly better. Choosing that lens was not a guess: round
+4's own result said fixes are where the defects are.
+
+---
+
+### Standing after five rounds
+
+**Twenty-nine findings across five rounds, all twenty-nine fixed.** Suite: 249 → **386
 passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by
