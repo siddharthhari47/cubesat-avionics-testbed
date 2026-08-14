@@ -44,3 +44,8 @@ data/datasets/*.csv
 
 # Cached source PDFs for research analysis -- large and re-downloadable from NTRS
 research/analysis/_cache_*.pdf
+
+# Coverage artifacts. Round 10 chose its target by coverage, so this gets
+# regenerated often -- the report is evidence, the binary datafile is not.
+.coverage
+htmlcov/
