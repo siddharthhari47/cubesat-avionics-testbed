@@ -38,7 +38,7 @@ Every command gets exactly one of these back, per `COM-002` (within 1 s).
 |---|---|---|---|
 | 0x01 | `PING` | unused | Always accepted |
 | 0x02 | `GET_STATUS` | unused | Always accepted (status arrives on the next telemetry packet, not a separate reply) |
-| 0x03 | `SET_TELEMETRY_RATE` | rate in Hz, 0.5-10 (`FSW-001`) | Accepted if in range, else `REJECTED_INVALID_PARAM` |
+| 0x03 | `SET_TELEMETRY_RATE` | rate in Hz, 0.5-10 (`FSW-001`) | Accepted if in range, else `REJECTED_INVALID_PARAM`. **Downlink cadence only.** It does not change how fast faults are detected — FDIR runs at a fixed `FDIR_TICK_HZ`. Until review round 10 it did both, and throttling the downlink to 0.5 Hz slowed detection by 20×. |
 | 0x04 | `ENTER_SAFE_MODE` | unused | Accepted from any mode (operator-forced SAFE entry) |
 | 0x05 | `EXIT_SAFE_MODE` | unused | Accepted only if not in SAFE, or in SAFE with no active fault (`FDIR-005`); otherwise `REJECTED_SAFE_MODE_FAULT_ACTIVE` |
 | 0x06 | `RESET_FAULTS` | unused | Clears latched fault flags whose underlying condition has cleared; a fault still actively occurring is not cleared |
@@ -47,6 +47,13 @@ Every command gets exactly one of these back, per `COM-002` (within 1 s).
 | 0x09 | `DISABLE` (test function) | test function ID | Accepted only in TEST, else `REJECTED_NOT_ALLOWED_IN_MODE` |
 | `0x0A` | `RECOMMISSION_REFERENCE` | — | Discard the commissioning voltage reference and capture a new one. **The escape from R7's trap:** a reference captured wrongly makes the drift detector latch on healthy telemetry, which sheds a rail, and neither `RESET_FAULTS` nor a capability restore can clear it — the condition genuinely is breaching against a reference that is itself wrong. Always `ACCEPTED`. |
 | `0x0B` | `RESTORE_CAPABILITY` | — | Return to full capability from a degraded rung, re-powering shed rails. Refused with `REJECTED_CONDITION_STILL_ACTIVE` while the cause is present — the same evidence discipline as `EXIT_SAFE_MODE`. |
+
+**Every command in this table must be reachable from the ground-station console.**
+Round 4 added `0x0A` and `0x0B` to this dictionary and to the flight computer and put no
+control on the operator interface, so for five further rounds the two commands documented
+here as "the escape" could not actually be sent by anyone. A command in the ICD with no
+operator interface is not a capability. `tests/test_review_round10.py` asserts this over
+the whole enum, so command `0x0C` cannot repeat it.
 
 ## Status enum (offset 5 of ack packet)
 

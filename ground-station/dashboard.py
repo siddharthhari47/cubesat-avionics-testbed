@@ -16,8 +16,10 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from link import GroundLink, proto  # noqa: E402
 from timeline import build_timeline, flag_authority, summarise  # noqa: E402
+import fdir.config as cfg  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
@@ -42,8 +44,13 @@ with st.sidebar:
     rate = st.number_input(
         "Rate (Hz)", value=1.0, min_value=0.5, max_value=10.0, step=0.5, key="rate_input",
     )
+    st.caption(
+        "Downlink cadence only. Fault detection runs at a fixed "
+        f"{cfg.FDIR_TICK_HZ:g} Hz and is not affected by this setting."
+    )
     if st.button("Set rate", width="stretch"):
-        link.send_command(proto.CommandId.SET_TELEMETRY_RATE, param=float(rate))
+        if not link.send_command(proto.CommandId.SET_TELEMETRY_RATE, param=float(rate)):
+            st.error("SET_TELEMETRY_RATE NOT SENT — link is down.")
 
 
 MODE_COLOR = {
@@ -187,23 +194,46 @@ def live_dashboard():
 
     with st.container(border=True):
         st.subheader("Command console")
+        def send(cmd_id, param=0.0):
+            # send_command returns False when the link is down, and every call
+            # site used to discard it (R10-2). The operator pressed "Enter SAFE
+            # mode", saw no error, and saw an empty command log -- which is
+            # exactly what a sent-but-not-yet-acked command looks like. On a
+            # real vehicle that is an operator believing they safed a spacecraft
+            # they did not reach.
+            if not link.send_command(cmd_id, param=param):
+                st.error(f"{proto.CommandId(cmd_id).name} NOT SENT — link is down.")
+
         with st.container(horizontal=True):
             if st.button("Ping"):
-                link.send_command(proto.CommandId.PING)
+                send(proto.CommandId.PING)
             if st.button("Get status"):
-                link.send_command(proto.CommandId.GET_STATUS)
+                send(proto.CommandId.GET_STATUS)
             if st.button("Enter SAFE mode"):
-                link.send_command(proto.CommandId.ENTER_SAFE_MODE)
+                send(proto.CommandId.ENTER_SAFE_MODE)
             if st.button("Exit SAFE mode"):
-                link.send_command(proto.CommandId.EXIT_SAFE_MODE)
+                send(proto.CommandId.EXIT_SAFE_MODE)
             if st.button("Reset faults"):
-                link.send_command(proto.CommandId.RESET_FAULTS)
+                send(proto.CommandId.RESET_FAULTS)
             if st.button("Request log"):
-                link.send_command(proto.CommandId.REQUEST_LOG)
+                send(proto.CommandId.REQUEST_LOG)
             if st.button("Enter TEST mode"):
-                link.send_command(proto.CommandId.ENABLE, param=1)
+                send(proto.CommandId.ENABLE, param=1)
             if st.button("Exit TEST mode"):
-                link.send_command(proto.CommandId.DISABLE, param=1)
+                send(proto.CommandId.DISABLE, param=1)
+
+        # R7/R8 operator escapes. Round 4 added these opcodes to the ICD and a
+        # handler to the flight computer, and stopped there -- so for six rounds
+        # the two commands documented as "the escape hatch" were reachable from
+        # no operator interface at all, which is the same defect round 4 was
+        # fixing. An escape the ground cannot reach is not an escape.
+        st.caption("Operator escapes — recovery from a bad commissioning reference "
+                   "or a capability level the vehicle will not leave on its own.")
+        with st.container(horizontal=True):
+            if st.button("Recommission reference", type="secondary"):
+                send(proto.CommandId.RECOMMISSION_REFERENCE)
+            if st.button("Restore capability", type="secondary"):
+                send(proto.CommandId.RESTORE_CAPABILITY)
 
         log = snap["command_log"]
         if log:

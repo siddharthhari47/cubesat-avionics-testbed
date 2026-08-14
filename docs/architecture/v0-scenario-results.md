@@ -78,6 +78,18 @@ hours it would not, which *masks* the gap rather than closing it. What is
 missing is a notion of an expected contact gap, and that is a V1 design
 question.
 
+**These latencies now describe the shipped flight path, which they did not before
+2026-08-14 (review §15).** Every number in this table comes from `scenarios/runner.py`
+at its fixed `DT` of 0.1 s — 10 Hz. The flight path, `simulator/run_simulator.py`, ran
+the FDIR engine from inside the telemetry loop at the operator-settable downlink rate,
+defaulting to 1 Hz. So the published figures were 10× better than the configuration that
+actually shipped, and an operator throttling the downlink to 0.5 Hz to save power made
+detection 20× slower than this table without any indication that had happened.
+
+The engine now runs on its own fixed-rate loop at `cfg.FDIR_TICK_HZ`, and a test pins
+that constant to the harness `DT` — change either without the other and the suite fails
+rather than quietly invalidating this table.
+
 **Correction, 2026-08-12.** Every comms-driven latency above was previously
 recorded as **0.10 s** and is now **5.10 s**. The old figure was wrong, and
 not by a rounding error — it was an artifact.

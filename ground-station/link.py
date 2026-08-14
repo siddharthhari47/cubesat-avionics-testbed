@@ -67,6 +67,20 @@ class GroundLink:
         self.decode_error_count = 0
         self.last_decode_error = None
 
+        # R10-3: corrupted_rx_count counts corruption EPISODES, not lost
+        # packets, and those are different numbers. Measured: one truncated
+        # packet costs two packets -- the truncated one plus the next good one,
+        # which read_packet swallows while trying to finish the first -- and
+        # reports a single episode. G3 fixed "we discard the evidence"; the
+        # evidence kept was still the wrong quantity for "packet loss vs.
+        # range", which CLAUDE.md names as one of the five numbers.
+        #
+        # seq_num is the instrument for that, it is in every packet for exactly
+        # this purpose, and nothing in the project had ever looked at it.
+        self.packets_received = 0
+        self.packets_lost = 0
+        self._last_seq = None
+
         self._sock = None
         self._pending = {}
         self._heartbeat_seqs = set()
@@ -103,6 +117,8 @@ class GroundLink:
                 self._sock = sock
                 self.connected = True
                 self.connect_error = None
+            with self.lock:
+                self._last_seq = None      # new link, new sequence baseline
             try:
                 self._read_loop(sock)
             except Exception as e:      # noqa: BLE001 - see below
@@ -141,6 +157,7 @@ class GroundLink:
                 return  # connection closed
             if isinstance(packet, proto.TelemetryPacket):
                 with self.lock:
+                    self._note_sequence(packet.seq_num)
                     self.latest = packet
                     self.history.append(packet)
                 self._log_csv(packet)
@@ -157,6 +174,34 @@ class GroundLink:
                         "param": pending["param"] if pending else None,
                         "status": _status_name(packet.status),
                     })
+
+    def _note_sequence(self, seq):
+        """
+        Count downlink gaps. Caller holds self.lock.
+
+        The flight computer increments seq_num once per TRANSMITTED packet
+        (mod 65536), so a gap is packets that left the vehicle and did not
+        arrive. That is the definition of packet loss, and it counts losses the
+        framer never sees -- a packet dropped entirely on the RF link produces
+        no corruption episode at all, because there are no bad bytes to notice.
+
+        A reconnect resets the baseline rather than reporting the whole outage
+        as loss: the vehicle keeps counting while nobody is listening, and
+        "packets sent while we were disconnected" is a different measurement.
+        """
+        self.packets_received += 1
+        if self._last_seq is not None:
+            gap = (seq - self._last_seq - 1) % 65536
+            # A full wrap-distance gap is far more likely a restarted flight
+            # computer than 65535 genuinely lost packets. Do not invent loss.
+            if 0 < gap < 1000:
+                self.packets_lost += gap
+        self._last_seq = seq
+
+    def packet_loss_pct(self):
+        """Loss as a percentage of packets the vehicle actually transmitted."""
+        sent = self.packets_received + self.packets_lost
+        return (100.0 * self.packets_lost / sent) if sent else 0.0
 
     def _heartbeat_loop(self):
         """
@@ -247,4 +292,7 @@ class GroundLink:
                 "corrupted_rx_count": self.corrupted_rx_count,
                 "decode_error_count": self.decode_error_count,
                 "last_decode_error": self.last_decode_error,
+                "packets_received": self.packets_received,
+                "packets_lost": self.packets_lost,
+                "packet_loss_pct": self.packet_loss_pct(),
             }

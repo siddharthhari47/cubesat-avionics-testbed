@@ -21,7 +21,7 @@ One fixed-format packet, sent at the configured telemetry rate (`FSW-001`).
 |---|---|---|---|---|
 | 0 | `sync` | uint8 | 1 | Fixed `0xA5` — lets a receiver find packet boundaries in a byte stream |
 | 1 | `packet_id` | uint8 | 1 | `0x01` = TELEMETRY |
-| 2 | `seq_num` | uint16 | 2 | Increments every packet, wraps at 65535 |
+| 2 | `seq_num` | uint16 | 2 | Increments once per **transmitted** packet, wraps at 65535. Not once per FDIR cycle — the two rates differ (see `FDIR_TICK_HZ`), and the ground counts gaps in this field to measure packet loss (GS-004). |
 | 4 | `timestamp_ms` | uint32 | 4 | Mission elapsed time in ms since BOOT |
 | 8 | `mode` | uint8 | 1 | See Mode enum below |
 | 9 | `fault_flags` | uint32 | 4 | Bitmask, see Fault Flag Bits below |

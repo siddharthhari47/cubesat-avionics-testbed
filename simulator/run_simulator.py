@@ -83,6 +83,7 @@ def _load_ml_detector():
 from environment import SpacecraftEnvironment, FAULT_TYPES  # noqa: E402
 from hardware_sim import SimulatedPowerPort, SimulatedResetPort  # noqa: E402
 from fdir.executor import RecoveryExecutor  # noqa: E402
+import fdir.config as cfg  # noqa: E402
 from protocol import (  # noqa: E402
     AckPacket, AckStatus, CommandId, CommandPacket, FaultFlag, HealthFlag, Mode,
     TelemetryPacket, read_packet,
@@ -90,7 +91,8 @@ from protocol import (  # noqa: E402
 
 
 class Simulator:
-    def __init__(self, telemetry_rate_hz: float, seed=None, use_ml: bool = False):
+    def __init__(self, telemetry_rate_hz: float, seed=None, use_ml: bool = False,
+                 fdir_tick_hz: float = None):
         self.lock = threading.Lock()
         self.env = SpacecraftEnvironment(seed=seed)
         self.engine = FDIREngine()
@@ -114,7 +116,13 @@ class Simulator:
         self.boot_time = time.monotonic()      # for the wire timestamp_ms field only
         self.process_start = time.monotonic()
         self.seq_num = 0
+        # Downlink cadence. Operator-settable, and it governs NOTHING but how
+        # often a packet goes out.
         self.telemetry_rate_hz = telemetry_rate_hz
+        # Safety cadence. Fixed, not operator-settable, and the only thing that
+        # decides how fast a fault is noticed. See fdir/config.py FDIR_TICK_HZ.
+        self.fdir_tick_hz = cfg.FDIR_TICK_HZ if fdir_tick_hz is None else fdir_tick_hz
+        self._latest_sample = None
         self.cmd_rx_count = 0
         self.cmd_accept_count = 0
         self.cmd_reject_count = 0
@@ -127,9 +135,19 @@ class Simulator:
     # ---- tick: environment -> FDIR -> wire packet -------------------------------------------------
 
     def tick(self) -> TelemetryPacket:
+        """
+        One FDIR cycle. Called at fdir_tick_hz, NEVER at the downlink rate.
+
+        Returns a snapshot packet for callers that want to see the resulting
+        state; it does NOT consume a downlink sequence number. Use
+        downlink_packet() for anything that actually goes on the wire, so
+        seq_num stays what the ICD says it is -- a count of transmitted packets,
+        which is the only instrument that can measure packet loss.
+        """
         with self.lock:
             now = time.monotonic()
-            sample, _truth = self.env.step(1.0 / self.telemetry_rate_hz)
+            sample, _truth = self.env.step(1.0 / self.fdir_tick_hz)
+            self._latest_sample = sample
             self.engine.tick(sample, now, ml_advisory=self._ml_advisory(sample))
             self._update_comms_loss(now)
             # Drain the engine's proposals. Once per tick, after tick() and
@@ -216,8 +234,21 @@ class Simulator:
                 self.conn = None
                 print("[sim] telemetry send failed -- treating ground contact as lost")
 
+    def downlink_packet(self):
+        """
+        The next packet to transmit, built from the most recent FDIR sample.
+
+        Consumes a sequence number, because that is what the ground counts gaps
+        in. Returns None before the first tick has produced a sample -- the
+        downlink cannot outrun the sensors.
+        """
+        with self.lock:
+            if self._latest_sample is None:
+                return None
+            self.seq_num = (self.seq_num + 1) % 65536
+            return self._build_packet(self._latest_sample)
+
     def _build_packet(self, sample) -> TelemetryPacket:
-        self.seq_num = (self.seq_num + 1) % 65536
         timestamp_ms = int((time.monotonic() - self.boot_time) * 1000) % (2**32)
         uptime_s = int(time.monotonic() - self.process_start)
         return TelemetryPacket(
@@ -372,16 +403,32 @@ def client_handler(sim: Simulator, conn: socket.socket, addr):
         print(f"[sim] ground station disconnected: {addr}")
 
 
-def telemetry_loop(sim: Simulator, stop_event: threading.Event):
+def fdir_loop(sim: Simulator, stop_event: threading.Event):
+    """
+    The safety loop. Fixed rate, and the ONLY caller of sim.tick().
+
+    Round 10 found this work living inside telemetry_loop, so the operator
+    command that sets the downlink rate was also setting the fault-detection
+    rate -- measured at 20x across the legal 0.5..10 Hz range. Nothing an
+    operator can send from the ground may slow this loop down.
+    """
     while not stop_event.is_set():
-        packet = sim.tick()
-        with sim.conn_lock:
-            conn = sim.conn
-        if conn is not None:
-            try:
-                conn.sendall(packet.pack())
-            except OSError:
-                sim.note_link_failure(conn)
+        sim.tick()
+        time.sleep(1.0 / sim.fdir_tick_hz)
+
+
+def telemetry_loop(sim: Simulator, stop_event: threading.Event):
+    """Downlink only. Samples whatever the FDIR loop last produced."""
+    while not stop_event.is_set():
+        packet = sim.downlink_packet()
+        if packet is not None:
+            with sim.conn_lock:
+                conn = sim.conn
+            if conn is not None:
+                try:
+                    conn.sendall(packet.pack())
+                except OSError:
+                    sim.note_link_failure(conn)
         time.sleep(1.0 / sim.telemetry_rate_hz)
 
 
@@ -424,6 +471,7 @@ def main():
     server.settimeout(0.5)
     print(f"[sim] listening on 127.0.0.1:{args.port}" + (f" (seed={args.seed})" if args.seed is not None else ""))
 
+    threading.Thread(target=fdir_loop, args=(sim, stop_event), daemon=True).start()
     threading.Thread(target=telemetry_loop, args=(sim, stop_event), daemon=True).start()
     threading.Thread(target=stdin_loop, args=(sim, stop_event), daemon=True).start()
 

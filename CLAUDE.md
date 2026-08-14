@@ -45,12 +45,18 @@ these follow):
   capability **derived** from confirmed rail state rather than asserted.
 - Fixed commissioning reference and drift detection, persisted across reset (R7).
 
-**420 tests.** Nine adversarial safety-review rounds are complete
-(`docs/architecture/v0-adversarial-safety-review.md`): **38 findings, all fixed**.
-Read §14 and the "standing" section before adding a component — the recurring
+**437 tests.** Ten adversarial safety-review rounds are complete
+(`docs/architecture/v0-adversarial-safety-review.md`): **42 findings, all fixed**.
+Read §15 and the "standing" section before adding a component — the recurring
 defects are not novel, and three of them repeat: a latched flag read as live
 state, state read before its writer runs this tick, and a component that works,
-is tested, and was never wired into the production path.
+is tested, and was never wired into the production path (five instances now).
+
+**Round 10 picked its target by measured coverage rather than by judgement, and
+that beat nine rounds of reasoning in one command.** The two least-tested files
+were the transport and the flight path, and neither had ever been a round's
+subject. Run `python -m coverage run -m pytest -q; python -m coverage report`
+before choosing where to look next.
 
 **The governing principle, and it is enforced in code rather than described:**
 ML detects. FDIR decides. Recovery executes. FDIR verifies. Hardware safety
@@ -107,11 +113,20 @@ Every measurable claim on the CV traces to one of these. Test campaigns are desi
 to produce them; if a design decision makes one of them unmeasurable, that is a
 problem worth raising.
 
-1. **Fault detection latency** — time from injected fault to flag raised (ms)
+1. **Fault detection latency** — time from injected fault to flag raised (ms).
+   Governed by `cfg.FDIR_TICK_HZ`, which is deliberately **not** the downlink
+   rate. Round 10 found the two fused, making this number 20× worse at the
+   operator's discretion; a test now pins `FDIR_TICK_HZ` to the scenario
+   harness `DT` so published latencies keep describing the shipped system.
 2. **Telemetry rate accuracy** — commanded vs. actual rate, and jitter
-3. **Packet loss vs. range** — percentage at measured distances, wired and wireless
+3. **Packet loss vs. range** — percentage at measured distances, wired and wireless.
+   Measured by counting `seq_num` gaps in `GroundLink` (`packet_loss_pct()`).
+   Do not substitute `corrupted_rx_count`: it counts corruption *episodes*, and
+   one truncated packet destroys two packets while reporting one episode.
 4. **Power consumption** — draw per mode (NOMINAL vs. SAFE)
 5. **Endurance** — longest continuous run without fault or reset
+
+Of these, only (1) has a value, and it is simulated. (2)–(5) need hardware.
 
 Do not write unquantified capability claims into the README or CV. "Implemented fault
 detection" is worthless; "detected sensor dropout within 250 ms across 40 injection

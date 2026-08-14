@@ -7,6 +7,24 @@ measured fact -- none of it has been characterized against real hardware yet.
 Revisit once V1 hardware exists to time actual sensor/bus behavior.
 """
 
+# --- loop rates ---------------------------------------------------------------
+
+# How often the FDIR engine samples and decides. This is a SAFETY rate and it is
+# deliberately NOT the telemetry downlink rate.
+#
+# Round 10 found the two fused: sim.tick() -- the whole engine -- was called only
+# from the telemetry loop, which sleeps 1/telemetry_rate_hz. SET_TELEMETRY_RATE is
+# an operator COMMS command bounded 0.5..10 Hz, so an operator throttling the
+# downlink to save power was also throttling fault detection. Measured across the
+# legal range: undervoltage detection went 0.20 s -> 4.00 s, exactly 20x, and the
+# shipped default of 1 Hz was 10x slower than every latency published in
+# docs/architecture/v0-scenario-results.md (which come from scenarios/runner.py at
+# a fixed DT of 0.1 s).
+#
+# 10 Hz because that is the rate every published measurement was taken at. How
+# often the vehicle TALKS must never change how fast it NOTICES.
+FDIR_TICK_HZ = 10.0
+
 # --- mode timing -------------------------------------------------------------
 
 BOOT_DURATION_S = 2.0                  # SYS-003 target: <=5s

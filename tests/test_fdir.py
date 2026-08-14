@@ -434,7 +434,11 @@ def test_comms_loss_boot_guard_regression():
     back. This exercises the actual Simulator class rather than FDIREngine in
     isolation, because that is where this particular guard lives.
     """
-    sim = Simulator(telemetry_rate_hz=50.0, seed=1234)
+    # fdir_tick_hz, not telemetry_rate_hz: this test wants fine-grained FDIR
+    # cycles, and until round 10 the only way to ask for that was to set the
+    # DOWNLINK rate -- which is the confusion R10-4 was about. Pinned explicitly
+    # so the tick granularity here stays what it was regardless of the default.
+    sim = Simulator(telemetry_rate_hz=1.0, fdir_tick_hz=50.0, seed=1234)
 
     # No ground station ever connects (sim.conn stays None throughout) --
     # exactly the boot-time state that used to trip a false COMMS_LOSS.
@@ -590,8 +594,8 @@ def test_reset_faults_reports_refusal_rather_than_claiming_success():
     import time
     from protocol import AckStatus, CommandId, CommandPacket
 
-    rate = 20.0
-    sim = Simulator(telemetry_rate_hz=rate, seed=4)
+    rate = 20.0        # FDIR cycles per second; see R10-4 in test_review_round10
+    sim = Simulator(telemetry_rate_hz=1.0, fdir_tick_hz=rate, seed=4)
     for _ in range(50):
         sim.tick()
         time.sleep(1.0 / rate)

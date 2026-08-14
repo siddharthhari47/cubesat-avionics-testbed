@@ -57,6 +57,13 @@ states plainly what this review is and is not.
 > contact, and two of the differences were defects in the evidence itself -- most
 > seriously, "recovered" being claimed for faults that were never addressed.
 > Thirty-eight findings, all fixed, **420 tests**.
+>
+> **ROUND 10 (§15) chose its target by measured COVERAGE rather than by judgement,
+> and found that fault detection latency was a function of the telemetry DOWNLINK
+> rate** -- 20x across a range any operator can command, with the shipped default
+> 10x slower than every published latency. Also: two telecommands no operator could
+> send, and nothing anywhere measuring packet loss. Forty-two findings, all fixed,
+> **437 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -1062,9 +1069,120 @@ the measurement without moving any result that was already honest.
 
 ---
 
-### Standing after nine rounds
+---
 
-**Thirty-eight findings across nine rounds, all thirty-eight fixed.** Suite: 249 → **420
+## 15. Round 10 -- picking the target by coverage instead of by intuition
+
+Nine rounds had chosen where to look by reasoning about risk. Round 10 measured it
+instead:
+
+| file | covered | statements never executed by any test |
+|---|---|---|
+| `ground-station/link.py` | **17%** | 126 of 152 |
+| `simulator/run_simulator.py` | **35%** | 164 of 253 |
+| `simulator/dataset_gen.py` | 49% | 37 |
+| `fdir/executor.py` | 84% | 17 |
+
+That is the transport and the flight path -- the two places whose defects the scenario
+harness structurally cannot see, and precisely where rounds 7, 8 and 9 kept finding
+things. Four findings, all reproduced by running code.
+
+The workflow fan-out died on the monthly spend limit for the **seventh** time: four
+agents launched, zero returned, and the run reported `candidates: 0`. That number means
+*the agents never ran*, not *nothing was found* -- the same trap this project has been
+caught by before, and the reason every round since the fifth has been probed directly.
+
+### R10-4 (HIGH): fault detection latency was a function of the downlink rate
+
+`sim.tick()` -- the entire FDIR engine -- was called from exactly one place:
+`telemetry_loop`, which sleeps `1/telemetry_rate_hz`. `SET_TELEMETRY_RATE` is an operator
+**comms** command bounded 0.5-10 Hz. So the rate at which the spacecraft noticed faults
+was set by the rate at which it talked to the ground.
+
+Measured, undervoltage, across the legal range:
+
+| downlink rate | FDIR sample period | detection latency | |
+|---|---|---|---|
+| 10.0 Hz | 0.10 s | **0.20 s** | the rate every published latency was taken at |
+| 5.0 Hz | 0.20 s | 0.40 s | |
+| 2.0 Hz | 0.50 s | 1.00 s | |
+| 1.0 Hz | 1.00 s | **2.00 s** | the shipped `--rate` default |
+| 0.5 Hz | 2.00 s | 4.00 s | |
+
+**Exactly 20x, commandable from the ground.** An operator throttling the downlink to save
+power -- an ordinary, sensible thing to do -- silently degraded fault detection by up to
+twenty times, and nothing anywhere said so.
+
+And the evidential half: `scenarios/runner.py` runs at a fixed `DT` of 0.1 s, so every
+latency in `v0-scenario-results.md` is a 10 Hz number, while the flight path shipped at
+1 Hz. **The published results described a configuration nobody ran** -- the fourth
+instance of harness and flight path disagreeing, which is now unambiguously this
+project's most recurrent defect.
+
+The fix splits the loops: `fdir_loop` runs the engine at `cfg.FDIR_TICK_HZ`, fixed and
+not operator-settable; `telemetry_loop` only downlinks a snapshot. A test asserts the
+latency is identical at every legal downlink rate, and another pins `FDIR_TICK_HZ` to the
+harness `DT`, so changing either without the other fails rather than quietly invalidating
+the results table.
+
+### R10-1 (HIGH): two telecommands no operator could send
+
+`RECOMMISSION_REFERENCE` (0x0A) and `RESTORE_CAPABILITY` (0x0B) -- the R7/R8 operator
+escapes -- existed on the wire and in the flight computer's handler, and on no operator
+interface at all. The console offered 9 of the 11 commands in the ICD.
+
+The sting is in the history. **Round 4 found this exact defect**, wrote *"an escape the
+ground cannot reach is not an escape"* in the source, added the opcodes and the
+flight-computer handler -- and stopped there. That comment sat directly above two
+commands that were still unreachable, through five further review rounds.
+
+Fifth instance of *built, tested in one place, never wired into the real one*, and the
+first that is a **half-completed fix of that same class**. The test now asserts the
+property over the whole enum, so command twelve cannot repeat it.
+
+### R10-2 (MEDIUM): a command that was not sent looked exactly like one that was
+
+`GroundLink.send_command` returns `False` when the link is down. All eight console call
+sites discarded it. The operator pressed *Enter SAFE mode*, got no error, and saw an
+empty command log -- which is also what a sent-but-not-yet-acked command looks like.
+
+**The regression test found a ninth call site I had missed while fixing the eight** --
+`SET_TELEMETRY_RATE`, on its own several hundred lines away. That is the round-4 lesson
+arriving on schedule: *the fix was applied where I looked and absent where I did not.*
+Asserting the property caught it; asserting the eight instances would not have.
+
+### R10-3 (MEDIUM): nothing measured packet loss
+
+`corrupted_rx_count` counts corruption **episodes**, and episodes are not lost packets.
+Measured: `read_packet` commits to a full read once it has a valid sync byte and packet
+id, so one truncated packet swallows the start of the next good one -- **two packets
+lost, one episode reported.** It also cannot see a packet dropped entirely on an RF link,
+which leaves no bad bytes to notice at all.
+
+"Packet loss vs. range" is one of the five numbers this project exists to produce.
+`seq_num` is in every packet for exactly this purpose and **nothing in the project had
+ever read it.** The ground station now counts sequence gaps, with a reconnect resetting
+the baseline (the vehicle keeps transmitting while nobody listens, and that is a
+different measurement) and a wrap-distance guard so a rebooted flight computer is not
+reported as 65,000 lost packets.
+
+Round 3's G3 had already fixed *"we throw the evidence away"*. The evidence it kept was
+still the wrong quantity for the number being claimed.
+
+### What this round says about the previous nine
+
+Every prior round picked its target by reasoning about where defects were likely.
+Coverage disagreed with all nine of them: the two least-tested files in the repository
+are the transport and the flight path, and they had never once been the subject of a
+round. **The reasoning was not wrong about what matters -- it was wrong about where it
+had already looked.** A cheap measurement settled in one command what nine rounds of
+judgement had not.
+
+---
+
+### Standing after ten rounds
+
+**Forty-two findings across ten rounds, all forty-two fixed.** Suite: 249 → **437
 passing**. Scenario suite: 17 scenarios run both in ground contact and out of it,
 undetected 0/17, negative assertions clean.
 
