@@ -34,13 +34,23 @@ these follow):
   campaigns whose state survives a reset.
 - `simulator/environment.py` — a physical state model (rails, battery, thermal
   nodes, bus topology). Signals are derived from state, never scripted.
-- `scenarios/runner.py` — 15 fault-injection scenarios including blinded
-  discrimination pairs, with negative assertions that gate the build.
+- `scenarios/runner.py` — 17 fault-injection scenarios including blinded
+  discrimination pairs, with negative assertions that gate the build. Every
+  scenario runs both in ground contact and out of it; out of contact is the
+  normal orbital state and two review rounds hid in the gap where it wasn't
+  modelled.
 - ML #1 as an advisory anomaly detector, streaming, with an exported C header.
 - Ground-station event timeline that renders flags by what authority they carry.
+- `fdir/degraded.py` — `Mode.DEGRADED` and a capability ladder (R8), with
+  capability **derived** from confirmed rail state rather than asserted.
+- Fixed commissioning reference and drift detection, persisted across reset (R7).
 
-**306 tests.** Two adversarial safety-review rounds are complete
-(`docs/architecture/v0-adversarial-safety-review.md`): ten findings, all fixed.
+**420 tests.** Nine adversarial safety-review rounds are complete
+(`docs/architecture/v0-adversarial-safety-review.md`): **38 findings, all fixed**.
+Read §14 and the "standing" section before adding a component — the recurring
+defects are not novel, and three of them repeat: a latched flag read as live
+state, state read before its writer runs this tick, and a component that works,
+is tested, and was never wired into the production path.
 
 **The governing principle, and it is enforced in code rather than described:**
 ML detects. FDIR decides. Recovery executes. FDIR verifies. Hardware safety
@@ -48,11 +58,23 @@ constrains everything. `ML_ANOMALY` and `ADAPTIVE_ANOMALY` appear in neither
 `SAFE_MODE_TRIGGER_FLAGS` nor `RECOVERY_AUTHORITY_FLAGS`, and tests fail if either
 bit is ever added.
 
-**What is deliberately not built:** ML #2 (the case study concludes it is not
-justified on current evidence — a clean interface seam exists and nothing more),
-fixed-reference drift detection (R7), and degraded modes (R8). All three are
-recorded in `docs/requirements/case-study-traceability.md` with what would close
-them. Do not quietly implement them without revisiting that reasoning.
+**What is deliberately not built:** ML #2 — the case study concludes it is not
+justified on current evidence, so a clean interface seam exists and nothing more.
+Recorded in `docs/requirements/case-study-traceability.md`. Do not quietly
+implement it without revisiting that reasoning. R7 (fixed-reference drift) and R8
+(degraded modes) were the other two gaps and are now closed; all 11 case-study
+requirements are met.
+
+**R8's caveat must travel with it:** "pre-validated" means measured, and nothing
+here has been measured. Capability power budgets are declared estimates —
+`declared_only=True` on every set, with a test that fails if it is flipped
+without updating the traceability doc.
+
+**The one known design gap, recorded as a scenario rather than a footnote:**
+the system cannot distinguish expected silence between ground passes from
+anomalous silence. `healthy but out of view` is a healthy vehicle that opens a
+comms recovery campaign, which is R5 working exactly as specified. Closing it
+needs a notion of an expected contact gap — a V1 design question, not a patch.
 
 Next milestone is V1, which is blocked on hardware arriving.
 

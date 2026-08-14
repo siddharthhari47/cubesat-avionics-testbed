@@ -80,6 +80,20 @@ class ScenarioResult:
     final_mode: str = ""
     outcome: str = Outcome.UNDETECTED
     forbidden_violations: List[str] = field(default_factory=list)
+    # EVERY cause the system named after injection, not just the first.
+    #
+    # `diagnosis` records the FIRST known cause, which is fine when the injected
+    # fault is the only thing wrong -- and wrong the moment anything else is
+    # already latched. Out of ground contact, COMMS_LOSS latches ~5 s after boot
+    # and every scenario recorded GROUND_LINK_LOST as "the diagnosis" while the
+    # system went on to correctly conclude POWER_UNDERVOLTAGE, THERMAL,
+    # SENSOR_FROZEN and so on. The measurement was wrong, not the system.
+    #
+    # The final cause is no better as a headline: a successfully recovered fault
+    # ends with nothing wrong, so "what did it settle on" reads as UNKNOWN for
+    # the runs that went best. What the correctness column should mean is DID IT
+    # EVER REACH THE RIGHT CONCLUSION, which needs the whole set.
+    causes_seen: set = field(default_factory=set)
     notes: str = ""
 
     @property
@@ -100,6 +114,13 @@ class Scenario:
     duration_s: float = 120.0
     inject_at_s: float = 5.0
     per_rail_sensing: bool = True          # False = blind the diagnosis layer
+    # False = no ground station in view, independent of whether the radio works.
+    # This is the NORMAL state of a CubeSat for most of every orbit, and the
+    # suite had never modelled it: the harness always supplied link_healthy=True
+    # unless a scenario specifically injected comms loss. Rounds 7 and 8 both
+    # found defects that live exactly in that gap, so the gap is now a dimension
+    # rather than an assumption.
+    ground_contact: bool = True
     obc_reset_at_s: Optional[float] = None
     note: str = ""
 
@@ -122,8 +143,18 @@ class Harness:
             sample.rail_current_a = None
         now = self.env.t
         self.engine.tick(sample, now)
-        self.engine.note_link_state(now, link_established=self.env.link_healthy,
-                                    seconds_since_contact=sample.seconds_since_ground_contact)
+        if self.sc.ground_contact:
+            link_established = self.env.link_healthy
+            since_contact = sample.seconds_since_ground_contact
+        else:
+            # Out of view. The radio may be perfectly healthy; there is simply
+            # nobody listening, which is what an orbit looks like between
+            # passes. Deliberately NOT modelled by breaking the radio -- that
+            # would be a different fault.
+            link_established = False
+            since_contact = now
+        self.engine.note_link_state(now, link_established=link_established,
+                                    seconds_since_contact=since_contact)
         self.executor.step(self.engine, now)
         return sample, truth
 
@@ -156,9 +187,11 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
             if not r.detected and (h.engine.fault_flags & sc.expect_flags):
                 r.detected = True
                 r.detection_latency_s = round(h.env.t - injected_at, 3)
-            if r.diagnosis is None and h.engine.diagnosis.is_known:
-                r.diagnosis = h.engine.diagnosis.cause.name
-                r.diagnosis_latency_s = round(h.env.t - injected_at, 3)
+            if h.engine.diagnosis.is_known:
+                r.causes_seen.add(h.engine.diagnosis.cause.name)
+                if r.diagnosis is None:
+                    r.diagnosis = h.engine.diagnosis.cause.name
+                    r.diagnosis_latency_s = round(h.env.t - injected_at, 3)
 
         if h.engine.fault_flags & sc.forbid_flags:
             bad = FaultFlag(h.engine.fault_flags & sc.forbid_flags)
@@ -175,7 +208,23 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
     r.recovery_attempted = r.recovery_attempts > 0
     c = h.engine.campaign
     if c is not None:
-        r.recovery_verified = c.state == CampaignState.SUCCEEDED
+        # A SUCCEEDED campaign is not evidence that THE INJECTED FAULT was
+        # recovered -- only that some campaign achieved its verification
+        # condition. Out of ground contact the comms ladder opens and succeeds
+        # for every scenario (power-cycling a healthy radio "works"), so
+        # `undervoltage` reported RECOVERED with UNDERVOLTAGE_CRITICAL still
+        # latched and the battery still sagging.
+        #
+        # That is the worst category of defect this project can have: a measured
+        # result that means something other than what it says, in the document
+        # that exists to be the evidence. The campaign's trigger must relate to
+        # the fault under test.
+        relates = bool(int(c.trigger) & sc.expect_flags) if sc.expect_flags else False
+        r.recovery_verified = c.state == CampaignState.SUCCEEDED and relates
+        if c.state == CampaignState.SUCCEEDED and not relates:
+            r.notes = (f"a campaign succeeded but its trigger "
+                       f"({FaultFlag(c.trigger)!r}) is unrelated to the injected "
+                       f"fault; not counted as recovery")
         if r.recovery_verified and injected_at is not None:
             r.recovery_latency_s = round(h.env.t - injected_at, 3)
     r.final_mode = Mode(h.engine.mode).name
@@ -191,10 +240,18 @@ def run_scenario(sc: Scenario) -> ScenarioResult:
         # until R10 got a scenario, which is why the gap survived so long.
         r.diagnosis_correct = r.diagnosis is None
         r.diagnosis = r.diagnosis or "UNKNOWN (held)"
-    elif sc.expect_cause is not None and r.diagnosis is not None:
-        r.diagnosis_correct = (r.diagnosis == sc.expect_cause.name)
     elif sc.expect_cause is not None:
-        r.diagnosis_correct = False
+        # Did it EVER reach the right conclusion, not merely say it first.
+        r.diagnosis_correct = sc.expect_cause.name in r.causes_seen
+        if r.diagnosis_correct and r.diagnosis != sc.expect_cause.name:
+            r.notes = (r.notes or
+                       f"reached {sc.expect_cause.name} after first reporting "
+                       f"{r.diagnosis}")
+            # A results table reading "GROUND_LINK_LOST | correct: yes" is
+            # precisely the kind of evidence R9-1 was about -- the number is
+            # right and the row says something else. Show both causes so the
+            # column and the correctness verdict describe the same event.
+            r.diagnosis = f"{r.diagnosis}->{sc.expect_cause.name}"
 
     if sc.inject is None:
         # A control run has no fault to recover from. Labelling it "recovered"
@@ -372,20 +429,56 @@ def build_suite() -> List[Scenario]:
                                   | FaultFlag.RAIL_OVERCURRENT),
                  seed=71, duration_s=90.0,
                  note="R10: measurable, unexplainable, and correctly acted on by NOT acting"),
+
+        # -- OUT OF GROUND CONTACT ------------------------------------------
+        # The normal state of a CubeSat for most of every orbit, and a state
+        # this suite never modelled until round 9. Rounds 7 and 8 both found
+        # defects living in exactly that gap, so it is a dimension now.
+        #
+        # These pair with their in-contact twins above: same fault, same seed,
+        # differing only in whether anyone is listening.
+        Scenario("undervoltage (out of contact)", "undervoltage",
+                 expect_flags=int(FaultFlag.UNDERVOLTAGE_CRITICAL),
+                 expect_cause=Cause.POWER_UNDERVOLTAGE,
+                 ground_contact=False, seed=42, duration_s=60.0,
+                 note="an acute fault must not be masked by the silence around it"),
+        Scenario("thermal excursion (out of contact)", "thermal",
+                 expect_flags=int(FaultFlag.THERMAL_ANOMALY),
+                 expect_cause=Cause.THERMAL,
+                 ground_contact=False, seed=43, duration_s=60.0,
+                 note="pairs with the in-contact run; only the listener differs"),
+
+        # THE DESIGN GAP, recorded as a scenario rather than a footnote.
+        #
+        # A perfectly healthy vehicle, simply out of view, opens a comms
+        # recovery campaign and power-cycles its radio. That is R5 working as
+        # specified -- CSSWE says loss of contact is a fault condition with an
+        # autonomous response -- but the system has NO WAY TO DISTINGUISH
+        # expected silence between passes from anomalous silence. At the
+        # test-scale COMMS_RECOVERY_TRIGGER_S (30 s) it fires almost at once;
+        # at a flight-scale value (hours) it would not, which MASKS the gap
+        # rather than closing it.
+        #
+        # Deliberately not forbidding the action: it is correct per the
+        # requirement. What is missing is a notion of an expected contact gap,
+        # and that is a V1 design question, not a bug to patch here.
+        Scenario("healthy but out of view", None,
+                 expect_flags=0, ground_contact=False, seed=71, duration_s=120.0,
+                 note="R5 fires on expected silence; no concept of a pass schedule exists"),
     ]
 
 
 def main() -> int:
     results = [run_scenario(sc) for sc in build_suite()]
 
-    print(f"{'scenario':<42}{'det':>5}{'lat_s':>8}{'diagnosis':>24}{'ok':>4}{'outcome':>16}{'act':>5}")
-    print("-" * 104)
+    print(f"{'scenario':<42}{'det':>5}{'lat_s':>8}{'diagnosis':>38}{'ok':>4}{'outcome':>16}{'act':>5}")
+    print("-" * 118)
     for r in results:
         det = "yes" if r.detected else "NO"
         lat = f"{r.detection_latency_s:.2f}" if r.detection_latency_s is not None else "-"
         diag = r.diagnosis or "-"
         ok = "-" if r.diagnosis_correct is None else ("yes" if r.diagnosis_correct else "NO")
-        print(f"{r.name:<42}{det:>5}{lat:>8}{diag:>24}{ok:>4}{r.outcome:>16}{r.recovery_attempts:>5}")
+        print(f"{r.name:<42}{det:>5}{lat:>8}{diag:>38}{ok:>4}{r.outcome:>16}{r.recovery_attempts:>5}")
 
     violations = [(r.name, v) for r in results for v in r.forbidden_violations]
     print()

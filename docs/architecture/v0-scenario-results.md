@@ -40,6 +40,43 @@ understand well enough to model, what does the architecture actually do about it
 | sensor not responding | yes | 0.20 | `SENSOR_NOT_RESPONDING` | ✅ | detected_only | 0 |
 | gradual drift | yes | **13.60** | `DEGRADATION` | ✅ | contained | 1 |
 | unexplained transient | yes | **0.30** | *UNKNOWN (held)* | ✅ | **unknown_held** | 0 |
+| undervoltage *(out of contact)* | yes | 0.30 | `GROUND_LINK_LOST` → `POWER_UNDERVOLTAGE` | ✅ | contained | 1 |
+| thermal excursion *(out of contact)* | yes | 0.40 | `GROUND_LINK_LOST` → `THERMAL` | ✅ | contained | 1 |
+| healthy but out of view | no | — | — | — | **clean** | 1 |
+
+**Ground contact is a dimension of this suite, added 2026-08-14 (review §14).**
+Everything above the last three rows runs *in contact*. That was an assumption
+nobody had stated, and it is the wrong default: a CubeSat is out of ground
+contact for most of every orbit. Out of contact is modelled as **nobody
+listening** — deliberately not as a broken radio, which is a different fault.
+
+Running all fifteen scenarios both ways, **ten behaved differently**, and the
+nominal control violated its negative assertion. Two of those differences were
+defects in the *evidence*, not the spacecraft:
+
+- `recovered` was being read straight off `campaign.state == SUCCEEDED` without
+  asking what the campaign recovered. Out of contact the comms ladder opens for
+  every scenario and succeeds — power-cycling a healthy radio "works" — so
+  `undervoltage` reported **RECOVERED** with `UNDERVOLTAGE_CRITICAL` still
+  latched and the battery still sagging.
+- The `Diagnosis` column recorded the *first* known cause. Out of contact,
+  `COMMS_LOSS` latches about 5 s after boot, so every scenario read
+  `GROUND_LINK_LOST` while the system went on to conclude correctly. The arrow
+  rows above show both: what it said first, and what it settled on.
+
+The in-contact rows are unchanged, which is the check that matters — the fixes
+corrected the measurement without moving a result that was already honest.
+
+**`healthy but out of view` records a design gap, and is not a bug row.** A
+perfectly healthy vehicle opens a comms recovery campaign and power-cycles its
+radio. That is R5 behaving exactly as specified — CSSWE makes loss of contact a
+fault condition with an autonomous response — but the system has **no way to
+tell expected silence between passes from anomalous silence.** The scenario
+deliberately does not forbid the action, because the action is correct. At the
+test-scale 30 s trigger it fires almost at once; at a flight-scale value of
+hours it would not, which *masks* the gap rather than closing it. What is
+missing is a notion of an expected contact gap, and that is a V1 design
+question.
 
 **Correction, 2026-08-12.** Every comms-driven latency above was previously
 recorded as **0.10 s** and is now **5.10 s**. The old figure was wrong, and
@@ -89,8 +126,12 @@ action fired. This matters more than the positive column — four of five
 documented FDIR failures were wrong-action failures, and a suite with only
 positive assertions cannot catch those.
 
-**Outcome distribution (n=15 injected faults):** recovered 2, contained 9,
+**Outcome distribution (n=17 injected faults):** recovered 2, contained 11,
 detected-only 3, unknown-held 1, **undetected 0**.
+
+`recovered` stayed at 2 when the out-of-contact rows were added, and that is the
+point of the R9-1 fix: before it, both would have counted as recoveries on the
+strength of a comms campaign that had nothing to do with the injected fault.
 
 **Every injected fault is now detected and correctly diagnosed.** That is a
 statement about *this fault set*, which we chose and modelled — it says nothing

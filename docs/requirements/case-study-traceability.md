@@ -135,6 +135,20 @@ verified live over the real transport rather than only in the harness: a ground
 station that receives but never transmits latches at ~4.9 s against a 5.0 s timeout,
 while the same link with a heartbeat stays clean.
 
+**MET, with a design gap this requirement's own wording creates.** Review round 9 ran
+every scenario out of ground contact and added `healthy but out of view`: a perfectly
+healthy vehicle that opens a comms recovery campaign and power-cycles its radio. That
+is this requirement working exactly as written — but **the system cannot distinguish
+expected silence between passes from anomalous silence**, and expected silence is the
+normal state for most of every orbit.
+
+The scenario deliberately does **not** forbid the action, because the action is correct
+per R5. Raising `COMMS_RECOVERY_TRIGGER_S` to a flight-scale value of hours would stop
+it firing in test, which *masks* the gap rather than closing it. What would close it is
+a notion of an expected contact gap — a pass schedule, or a ground-commanded
+"next contact by" deadline — and that is a V1 design question, deliberately not patched
+here.
+
 ---
 
 ### R6 — Detectors must distinguish subsystem fault from data-path fault

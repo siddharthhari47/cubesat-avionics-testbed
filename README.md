@@ -37,8 +37,8 @@ simulation, and I've been deliberate about labelling what that does and doesn't 
 | | State | What that means |
 |---|---|---|
 | Simulator, ground station, fault injection | **Simulated** | Runs end-to-end over a live TCP link. Telemetry, telecommands, acknowledgements, CSV logging, fault injection, recovery. |
-| Deterministic FDIR engine (`fdir/`) | **Simulated** | Its own hardware-agnostic package — detectors, diagnosis, bounded recovery campaigns, degraded modes. 332 automated tests. |
-| Fault-injection scenarios (`scenarios/`) | **Simulated** | 15 scenarios, each with negative assertions. Every one detected and correctly diagnosed; the numbers are below. |
+| Deterministic FDIR engine (`fdir/`) | **Simulated** | Its own hardware-agnostic package — detectors, diagnosis, bounded recovery campaigns, degraded modes. 420 automated tests. |
+| Fault-injection scenarios (`scenarios/`) | **Simulated** | 17 scenarios, run both in ground contact and out of it, each with negative assertions. Every one detected and correctly diagnosed; the numbers are below. |
 | Anomaly detection (`ml/`) | **Trained** | An Isolation Forest trained on synthetic nominal telemetry and evaluated against held-out episodes. Synthetic data only. |
 | Firmware (`firmware/`) | **Not built** | Planning docs and hand-written C structs matching the wire protocol. Never compiled, never flashed. |
 | Anything at all | **Hardware-tested** | No. Not one line. There is no board yet. |
@@ -126,15 +126,15 @@ have it as a measurement than as an opinion.
 The blinded halves of those pairs stay in the suite permanently. Delete them and it
 goes back to being an opinion.
 
-## I went looking for bugs in my own work, and found ten
+## I went looking for bugs in my own work, and found thirty-eight
 
 The line at the top of this README — that a system is good because you can show it was
 checked, not because it works — felt a bit cheap to write and then not act on. So I ran
-two adversarial passes over the FDIR core, attacking each safety property I'd claimed,
-with probes that execute rather than by re-reading code I'd already convinced myself
-about.
+adversarial passes over the FDIR core, attacking each safety property I'd claimed, with
+probes that execute rather than by re-reading code I'd already convinced myself about.
 
-Ten real defects. Three were serious:
+That is now **nine rounds and thirty-eight defects, all fixed.** The first two rounds
+found ten. Three of those were serious:
 
 - **A stuck flag meant a permanently confident wrong diagnosis.** `DATA_PATH_SUSPECT`
   was in neither of the two sets that let a flag be cleared, so one transient bus glitch
@@ -157,12 +157,33 @@ supposed to catch, and a second uncovered that a 5-second debounce had never onc
 actually run in any test or scenario. That happened four separate times — a latching
 flag being read as if it were live state.
 
-The write-up, including the two concerns that measurement *refuted*:
+**Seven more rounds followed, and the interesting part is what changed about the
+findings rather than how many there were.**
+
+- **A fix is a code change like any other, and mine have a high defect rate.** Round 4
+  found three of six defects inside that morning's fixes. Round 5 went four for four.
+  Each of those fixes had been verified against the defect it targeted and shipped
+  without anyone asking what *else* moved.
+- **After two or three instances of the same shape, stop fixing instances.** `capability`
+  is no longer asserted anywhere; it's *derived* from confirmed rail state, so the engine
+  cannot claim a configuration the hardware isn't in. The test asserts the property, not
+  the three cases.
+- **The worst defect wasn't logic.** `run_simulator.py` had never constructed a
+  `RecoveryExecutor` — autonomous recovery had never once executed on the live path,
+  only in the scenario harness. That was the third instance of *built, tested somewhere,
+  never wired into the real thing.*
+- **And the last round found the harness lying.** Every scenario had silently assumed the
+  spacecraft was in ground contact, which is not how a CubeSat spends most of an orbit.
+  Running them all out of contact too, ten of fifteen behaved differently and the nominal
+  control broke its own negative assertion — including runs reported as **recovered**
+  because a comms campaign succeeded while the injected fault was still latched.
+
+The write-up, round by round, including the concerns that measurement *refuted*:
 [`docs/architecture/v0-adversarial-safety-review.md`](docs/architecture/v0-adversarial-safety-review.md).
 
-What this doesn't establish: I reviewed my own code. Three of the ten only surfaced
-because fixing something else disturbed them, which is fairly weak evidence that a
-genuinely independent pass wouldn't find more.
+What this still doesn't establish: it is mostly my own code reviewed by me. The one
+independent pass found six defects in code written that same day, and the honest reading
+of nine rounds is that the rate of new findings has not yet gone to zero.
 
 ## Running it
 
@@ -233,7 +254,7 @@ scenarios/          Fault-injection scenarios with measured outcomes
 ml/                 Dataset generation, features, training, evaluation, embedded export
 ground-station/     Python mission-control dashboard
 firmware/           STM32 C. Planning and protocol headers only, nothing built
-tests/              332 tests
+tests/              420 tests
 docs/requirements/  System requirements, each with an ID and a verification method
 docs/architecture/  Block diagram, mode state machine, engineering decisions, ML report
 docs/interfaces/    Telemetry and command dictionaries — the byte-level contract

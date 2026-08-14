@@ -51,6 +51,12 @@ states plainly what this review is and is not.
 > most of every orbit. The scenario suite is byte-identical before and after the fix,
 > which is what a suite looks like when it cannot see the defect. Thirty-six findings,
 > all fixed, **417 tests**.
+>
+> **ROUND 9 (§14) closed that gap instead of probing around it: ground contact is now
+> a DIMENSION of the suite.** Ten of fifteen scenarios behaved differently out of
+> contact, and two of the differences were defects in the evidence itself -- most
+> seriously, "recovered" being claimed for faults that were never addressed.
+> Thirty-eight findings, all fixed, **420 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -995,10 +1001,72 @@ this size is telling you what it does not cover.
 
 ---
 
-### Standing after eight rounds
+---
 
-**Thirty-six findings across eight rounds, all thirty-six fixed.** Suite: 249 → **417
-passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
+## 14. Round 9 -- closing the gap the last two rounds hid in
+
+Rounds 7 and 8 both found defects in the space between the scenario harness and the
+flight path: a component never wired in, and a rule order that only misbehaves in
+conditions the harness never creates. Round 9 stopped probing around that gap and closed
+it, by making **ground contact a dimension of the suite** rather than an assumption.
+
+Every scenario now runs both in contact and out of it. Out of contact means *nobody is
+listening* -- deliberately not modelled by breaking the radio, which is a different
+fault. It is the normal state of a CubeSat for most of every orbit.
+
+**Ten of fifteen scenarios behaved differently, and the nominal control violated its
+negative assertion.** Two of those were real defects in the evidence itself.
+
+### R9-1 (HIGH): "recovered" was claimed for faults that were never addressed
+
+The runner read `recovery_verified` straight off `campaign.state == SUCCEEDED` without
+asking **what** the campaign recovered. Out of contact the comms ladder opens for every
+scenario and succeeds -- power-cycling a healthy radio "works" -- so `undervoltage`
+reported **RECOVERED** with `UNDERVOLTAGE_CRITICAL` still latched and the battery still
+sagging. Thermal, sensor-frozen and drift all did the same.
+
+This is the worst category of defect this project can have: not a bug in the spacecraft,
+but **a measured result that means something other than what it says, in the document
+that exists to be the evidence.** A campaign now only counts as recovery if its trigger
+relates to the fault under test.
+
+### R9-2 (MEDIUM): correctness measured the first diagnosis, not the right one
+
+`diagnosis` recorded the first known cause, which is fine only when the injected fault is
+the only thing wrong. Out of contact, `COMMS_LOSS` latches about 5 s after boot, so every
+scenario recorded `GROUND_LINK_LOST` while the system went on to correctly conclude
+`POWER_UNDERVOLTAGE`, `THERMAL`, `SENSOR_FROZEN` and the rest.
+
+**The measurement was wrong, not the system** -- round 8's fix works, and the harness was
+hiding it. The final cause is no better as a headline, since a successfully recovered
+fault ends with nothing wrong. So correctness now asks the question it should have asked
+all along: *did it ever reach the right conclusion?*
+
+### The design gap, recorded as a scenario rather than a footnote
+
+`healthy but out of view` is a perfectly healthy vehicle that opens a comms recovery
+campaign and power-cycles its radio. That is R5 working exactly as specified -- CSSWE says
+loss of contact is a fault condition with an autonomous response -- but **the system has
+no way to distinguish expected silence between passes from anomalous silence.**
+
+At the test-scale `COMMS_RECOVERY_TRIGGER_S` of 30 s it fires almost immediately. At a
+flight-scale value of hours it would not, which *masks* the gap rather than closing it.
+The scenario deliberately does not forbid the action, because the action is correct. What
+is missing is a notion of an expected contact gap, and that is a V1 design question.
+
+### The suite now measures what it claims to
+
+17 injected scenarios, undetected 0/17, negative assertions clean. More importantly the
+in-contact numbers are unchanged, which is the check that matters: the fixes corrected
+the measurement without moving any result that was already honest.
+
+---
+
+### Standing after nine rounds
+
+**Thirty-eight findings across nine rounds, all thirty-eight fixed.** Suite: 249 → **420
+passing**. Scenario suite: 17 scenarios run both in ground contact and out of it,
+undetected 0/17, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by
 a wider margin than expected: six defects in a single day's work, two of them in the

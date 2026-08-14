@@ -442,3 +442,70 @@ def test_loss_of_contact_alone_is_still_diagnosed():
     from fdir.diagnosis import Cause, diagnose
 
     assert diagnose(FaultFlag.COMMS_LOSS, _sample()).cause == Cause.GROUND_LINK_LOST
+
+
+# ---------------------------------------------------------------------------
+# Round 9: the suite never modelled being out of ground contact
+# ---------------------------------------------------------------------------
+
+def test_a_succeeded_campaign_only_counts_if_it_relates_to_the_injected_fault():
+    """
+    ROUND 9'S WORST FINDING, because it is a measured result that lies in the
+    document that exists to be the evidence.
+
+    The runner read recovery_verified straight off campaign.state without asking
+    WHAT the campaign recovered. Out of ground contact the comms ladder opens
+    and succeeds for every scenario -- power-cycling a healthy radio "works" --
+    so `undervoltage` reported RECOVERED with UNDERVOLTAGE_CRITICAL still
+    latched and the battery still sagging.
+    """
+    import sys as _s
+    _s.path.insert(0, str(REPO_ROOT / "scenarios"))
+    from dataclasses import replace
+
+    import runner
+
+    sc = [x for x in runner.build_suite() if x.name == "undervoltage"][0]
+    out_of_contact = runner.run_scenario(replace(sc, ground_contact=False))
+
+    assert out_of_contact.outcome != runner.Outcome.RECOVERED, (
+        "an unrelated campaign succeeding is not recovery of the injected fault"
+    )
+
+
+def test_correctness_means_the_system_ever_reached_the_right_cause():
+    """
+    The runner recorded the FIRST known diagnosis, which is fine only when the
+    injected fault is the only thing wrong. Out of contact, COMMS_LOSS latches
+    ~5 s after boot, so every scenario recorded GROUND_LINK_LOST while the
+    system went on to correctly conclude POWER_UNDERVOLTAGE, THERMAL,
+    SENSOR_FROZEN and the rest. The measurement was wrong, not the system.
+    """
+    import sys as _s
+    _s.path.insert(0, str(REPO_ROOT / "scenarios"))
+    from dataclasses import replace
+
+    import runner
+
+    sc = [x for x in runner.build_suite() if x.name == "thermal excursion"][0]
+    r = runner.run_scenario(replace(sc, ground_contact=False))
+
+    assert r.diagnosis_correct is True, "it did reach THERMAL"
+    assert "THERMAL" in r.causes_seen
+
+
+def test_an_acute_fault_out_of_contact_is_still_diagnosed():
+    """The system-level version of round 8's fix, through the real harness."""
+    import sys as _s
+    _s.path.insert(0, str(REPO_ROOT / "scenarios"))
+    import runner
+
+    names = {s.name for s in runner.build_suite()}
+    assert "undervoltage (out of contact)" in names, (
+        "the out-of-contact dimension must stay in the suite; it is the only "
+        "thing that models the normal state of an orbit"
+    )
+    assert "healthy but out of view" in names, (
+        "the design gap -- R5 firing on expected silence -- is recorded as a "
+        "scenario rather than a footnote, so it cannot be quietly forgotten"
+    )
