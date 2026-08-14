@@ -356,3 +356,89 @@ def test_the_engine_and_environment_share_a_time_base():
         "the telemetry loop's sleep is what keeps engine time and environment "
         "time in step; without it every duration-based detector is wrong"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round 8: loss of contact is the NORMAL state, and it masked everything
+# ---------------------------------------------------------------------------
+
+ACUTE = [
+    (FaultFlag.UNDERVOLTAGE_CRITICAL, "POWER_UNDERVOLTAGE"),
+    (FaultFlag.THERMAL_ANOMALY, "THERMAL"),
+    (FaultFlag.SENSOR_LOCKUP, "SENSOR_FROZEN"),
+    (FaultFlag.SENSOR_TIMEOUT, "SENSOR_NOT_RESPONDING"),
+    (FaultFlag.SENSOR_IMPLAUSIBLE, "SENSOR_CORRUPT"),
+    (FaultFlag.DRIFT_FROM_REFERENCE, "DEGRADATION"),
+    (FaultFlag.RECOVERY_FAILED, "RECOVERY_EXHAUSTED"),
+]
+
+
+def _sample(**kw):
+    from icd import RawSample
+    rails = {int(Rail.OBC): 0.12, int(Rail.RADIO): 0.10, int(Rail.SENSORS): 0.06,
+             int(Rail.ADCS): 0.08, int(Rail.PAYLOAD): 0.04}
+    d = dict(temp_c=25.0, accel_x=0.1, accel_y=0.2, accel_z=9.8, gyro_x=0.0,
+             gyro_y=0.0, gyro_z=0.0, mag_x=20.0, mag_y=5.0, mag_z=-40.0,
+             bus_voltage_v=5.0, bus_current_a=0.40, rail_current_a=rails)
+    d.update(kw)
+    return RawSample(**d)
+
+
+@pytest.mark.parametrize("flag,expected", ACUTE)
+def test_loss_of_contact_does_not_mask_an_acute_fault(flag, expected):
+    """
+    ROUND 8'S HEADLINE, and the worst-placed instance of the F1 defect class in
+    the whole review.
+
+    The COMMS_LOSS rule sat third and returned on every path, so every acute
+    fault beneath it reported as "ground link lost". That would be bad anywhere.
+    Here it is worse, because COMMS_LOSS is not an anomaly on a CubeSat -- it is
+    the NORMAL state for most of every orbit. An undervoltage, a thermal
+    excursion, a frozen sensor or an exhausted recovery ladder would all have
+    been masked for most of the mission.
+
+    Measured on the live flight path before the fix: eleven injected faults,
+    NINE of them diagnosed GROUND_LINK_LOST.
+
+    Being out of contact is only the best explanation when nothing else is
+    wrong.
+    """
+    from fdir.diagnosis import diagnose
+
+    assert diagnose(flag | FaultFlag.COMMS_LOSS, _sample()).cause.name == expected
+
+
+def test_the_compound_radio_diagnosis_still_outranks_the_acute_faults():
+    """
+    The split has to keep the COMPOUND case high. No contact AND a hot radio
+    rail together mean something neither says alone, and that pairing is the
+    project's headline discrimination measurement.
+    """
+    from fdir.diagnosis import Cause, diagnose
+
+    hot = {int(Rail.OBC): 0.12, int(Rail.RADIO): 1.0, int(Rail.SENSORS): 0.06,
+           int(Rail.ADCS): 0.08, int(Rail.PAYLOAD): 0.04}
+    d = diagnose(FaultFlag.COMMS_LOSS | FaultFlag.UNDERVOLTAGE_CRITICAL,
+                 _sample(rail_current_a=hot))
+    assert d.cause == Cause.RADIO_LATCHUP
+
+
+def test_the_discrimination_pair_survives_the_split():
+    """The measurement that justified the per-rail current hardware."""
+    from fdir.diagnosis import Cause, diagnose
+
+    hot = {int(Rail.OBC): 0.12, int(Rail.RADIO): 1.0, int(Rail.SENSORS): 0.06,
+           int(Rail.ADCS): 0.08, int(Rail.PAYLOAD): 0.04}
+    assert diagnose(FaultFlag.COMMS_LOSS, _sample(rail_current_a=hot)).cause \
+        == Cause.RADIO_LATCHUP
+    assert diagnose(FaultFlag.COMMS_LOSS, _sample(rail_current_a=None)).cause \
+        == Cause.GROUND_LINK_LOST
+    assert diagnose(FaultFlag.COMMS_LOSS, _sample()).cause == Cause.GROUND_LINK_LOST
+
+
+def test_loss_of_contact_alone_is_still_diagnosed():
+    """Demoting it must not silence it -- with nothing else wrong, it IS the
+    finding."""
+    from fdir.diagnosis import Cause, diagnose
+
+    assert diagnose(FaultFlag.COMMS_LOSS, _sample()).cause == Cause.GROUND_LINK_LOST

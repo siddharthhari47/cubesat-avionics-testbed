@@ -44,6 +44,13 @@ states plainly what this review is and is not.
 > -- no autonomous recovery action had ever executed on the live path, only in the
 > scenario harness. Third instance of "built, tested in one harness, never wired into
 > the real one". Thirty-five findings, all fixed, **407 tests**.
+>
+> **ROUND 8 (§13): nine of eleven faults on the live flight path diagnosed as
+> `GROUND_LINK_LOST`.** The comms rule sat third and masked every acute fault beneath
+> it -- and `COMMS_LOSS` is not an anomaly on a CubeSat, it is the normal state for
+> most of every orbit. The scenario suite is byte-identical before and after the fix,
+> which is what a suite looks like when it cannot see the defect. Thirty-six findings,
+> all fixed, **417 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -940,9 +947,57 @@ the wrong reason. Pinned by a test on the sleep rather than left as folklore.
 
 ---
 
-### Standing after seven rounds
+---
 
-**Thirty-five findings across seven rounds, all thirty-five fixed.** Suite: 249 → **407
+## 13. Round 8 -- loss of contact is the normal state, and it masked everything
+
+Round 7 wired the executor into the flight path for the first time. Round 8 asked the
+obvious follow-up: **does the flight path reproduce the harness results?** It did not,
+and the reason is the worst-placed instance of the F1 defect class in this review.
+
+Eleven faults injected on the live path. **Nine diagnosed `GROUND_LINK_LOST`** --
+undervoltage, thermal excursion, frozen sensor, corrupt sensor, drift, exhausted
+recovery, all of them.
+
+### Why
+
+The `COMMS_LOSS` rule sat third in `diagnose()` and returned on every path, so every
+acute fault beneath it was masked. That would be a defect anywhere. Here it is worse,
+because **`COMMS_LOSS` is not an anomaly on a CubeSat -- it is the normal state for most
+of every orbit.** A spacecraft between ground passes has it latched by definition. So the
+masking was not an edge case; it was the default condition of the mission.
+
+The scenario harness never saw it because the harness supplies `link_healthy=True` unless
+a scenario specifically injects comms loss. The flight path has no ground station attached
+most of the time, which is exactly what a real one looks like.
+
+### The fix
+
+The rule is split by specificity rather than demoted wholesale:
+
+- **High:** no contact **AND** a hot radio rail together -- a compound diagnosis more
+  specific than either symptom alone, and the project's headline discrimination
+  measurement. Stays above the acute faults.
+- **Low:** no contact with nothing else wrong -- moved below every acute fault.
+
+Being out of contact is only the best explanation when nothing else is wrong. If
+something else *is* wrong, that is the finding, and the silence is either a consequence of
+it or a coincidence -- never the better explanation.
+
+Measured after: three of eleven still report `GROUND_LINK_LOST`, and all three are
+correct. In each the acute fault genuinely resolved (rail shed, latch cleared) and the
+probe has no ground station attached, so loss of contact is the honest remaining answer.
+
+The scenario suite is byte-identical -- same outcomes, same latencies, negative
+assertions still clean -- which is itself the point: **the harness could not see this
+defect, and still cannot.** A suite that passes identically before and after a fix of
+this size is telling you what it does not cover.
+
+---
+
+### Standing after eight rounds
+
+**Thirty-six findings across eight rounds, all thirty-six fixed.** Suite: 249 → **417
 passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by

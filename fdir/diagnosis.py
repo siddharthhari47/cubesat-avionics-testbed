@@ -140,9 +140,9 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
                 f"downstream of it",
             )
 
-    # 3. Comms loss: latch-up and a merely-quiet link look identical on the
-    #    link itself. Per-rail current is what separates them -- which is the
-    #    measurement the hardware shortlist exists to justify.
+    # 3. The COMPOUND radio diagnosis: no contact AND a hot radio rail. That
+    #    pairing is more specific than either symptom alone, so it stays high.
+    #    Generic "no contact" does NOT stay high -- see rule 8.
     if fault_flags & FaultFlag.COMMS_LOSS:
         rail_current = None
         if sample is not None and sample.rail_current_a:
@@ -153,20 +153,6 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
                 f"no ground contact and the radio rail is drawing "
                 f"{rail_current:.3f} A, well above its nominal band",
             )
-        if rail_current is None:
-            # Without per-rail current we genuinely cannot tell these apart.
-            # Saying so is the honest answer, and it is also the argument for
-            # the sensing hardware.
-            return Diagnosis(
-                Cause.GROUND_LINK_LOST, Confidence.POSSIBLE,
-                "no ground contact; without per-rail current a radio fault "
-                "cannot be distinguished from a quiet link",
-            )
-        return Diagnosis(
-            Cause.GROUND_LINK_LOST, Confidence.LIKELY,
-            f"no ground contact and the radio rail is nominal "
-            f"({rail_current:.3f} A), so the radio is probably not the fault",
-        )
 
     if fault_flags & FaultFlag.UNDERVOLTAGE_CRITICAL:
         return Diagnosis(Cause.POWER_UNDERVOLTAGE, Confidence.LIKELY,
@@ -209,7 +195,40 @@ def diagnose(fault_flags: FaultFlag, sample: Optional[RawSample] = None) -> Diag
         return Diagnosis(Cause.RECOVERY_EXHAUSTED, Confidence.LIKELY,
                          "every rung of the recovery ladder ran without verification succeeding")
 
-    # 3. Something is flagged, but only by a detector that cannot say what.
+    # 8. Loss of ground contact, with nothing acute to explain.
+    #
+    #    THIS RULE USED TO SIT THIRD, AND IT MASKED EVERYTHING BELOW IT. That
+    #    was the F1 defect class in its worst possible position: COMMS_LOSS is
+    #    not an anomaly on a CubeSat, it is the NORMAL state for most of every
+    #    orbit, so an undervoltage, a thermal excursion, a frozen sensor or an
+    #    exhausted recovery ladder all reported as "ground link lost" for most
+    #    of the mission. Measured on the live flight path: eleven injected
+    #    faults, nine of them diagnosed GROUND_LINK_LOST.
+    #
+    #    Being out of contact is only the best explanation when nothing else is
+    #    wrong. If something else IS wrong, that is the finding and the silence
+    #    is a consequence of it -- or a coincidence, but never the better
+    #    explanation.
+    if fault_flags & FaultFlag.COMMS_LOSS:
+        rail_current = None
+        if sample is not None and sample.rail_current_a:
+            rail_current = sample.rail_current_a.get(int(Rail.RADIO))
+        if rail_current is None:
+            # Without per-rail current we genuinely cannot tell a radio fault
+            # from a quiet link. Saying so is the honest answer, and it is also
+            # the argument for the sensing hardware.
+            return Diagnosis(
+                Cause.GROUND_LINK_LOST, Confidence.POSSIBLE,
+                "no ground contact; without per-rail current a radio fault "
+                "cannot be distinguished from a quiet link",
+            )
+        return Diagnosis(
+            Cause.GROUND_LINK_LOST, Confidence.LIKELY,
+            f"no ground contact and the radio rail is nominal "
+            f"({rail_current:.3f} A), so the radio is probably not the fault",
+        )
+
+    # 9. Something is flagged, but only by a detector that cannot say what.
     #    This is the honest UNKNOWN, and it is the common case in the real
     #    failure record rather than an edge case.
     if fault_flags & _ADVISORY_ONLY:
