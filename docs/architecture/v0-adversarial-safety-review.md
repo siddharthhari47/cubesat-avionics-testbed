@@ -33,6 +33,12 @@ states plainly what this review is and is not.
 > four share one shape -- a fix applied where the author looked and absent where they did
 > not: one branch of two, total failure but not partial, one direction of a symmetric
 > pair, one entry point of two. Twenty-nine findings, all fixed, **386 tests**.
+>
+> **ROUND 6 (§11): the agent died on the limit, so it was probed directly.** Three more,
+> all in round-5 code, plus one I inflicted inside ten minutes while fixing them. The
+> difference is what came out of it: **capability is now DERIVED from confirmed rail
+> state rather than asserted**, which closes the whole class rather than another
+> instance. Thirty-two findings, all fixed, **399 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -820,9 +826,57 @@ single highest-yield lens is strictly better. Choosing that lens was not a guess
 
 ---
 
-### Standing after five rounds
+---
 
-**Twenty-nine findings across five rounds, all twenty-nine fixed.** Suite: 249 → **386
+## 11. Round 6 -- the agent died, and the fix finally closed a class
+
+Round 6's single agent died on the spend limit before returning anything (0 of 1, 85k
+tokens). The workflow route is now fully exhausted: a 15-agent fan-out got 2 through, a
+4-agent got 1, a 1-agent got 1, and this 1-agent got none.
+
+So round 6 was probed directly, against the questions round 5's own result implied. Three
+findings, all in round-5 code, all the same shape as round 5's four.
+
+| # | Severity | Defect |
+|---|---|---|
+| R6-1 | HIGH | Rollback `POWER_ON`s were fire-and-forget. They route to `note_restore_completed`, which returned early because `_restore_pending` was empty -- so a **refused** rollback was invisible and the engine claimed FULL with two rails dead |
+| R6-2 | MEDIUM | A downgrade could be proposed while restore or rollback `POWER_ON`s were still queued. Two two-phase machines sharing one intent queue, and whichever the executor drained last decided the physical outcome |
+| R6-3 | MEDIUM | A reset cleared the in-flight bookkeeping but not the queued intents, so a `POWER_ON` executed with nothing tracking it and the engine **under**-claimed: capability stuck at REDUCED with every rail powered |
+
+R6-1 is R5-3 again, exactly: one path made two-phase and the other left optimistic.
+
+### And one I inflicted while fixing them, inside ten minutes
+
+Deriving capability from confirmed rail state broke the rollback immediately, because the
+rollback computed which rails to restore as `rails_to_shed(self.capability, target)` --
+and capability had already moved by the time a refusal arrived, so the diff found nothing
+to roll back. **Remember the intent; do not re-derive it from state the intent itself
+changed.** Caught in the same session by the test that had just been written for R5-2,
+which is the first time in six rounds that an existing test caught a new fix's defect
+rather than a probe finding it afterwards.
+
+### Why this round is different from the five before it
+
+Every previous fix closed an instance. This one closes a class.
+
+**Capability is no longer asserted. It is derived.** `_rails_on` records only confirmed
+port results, and `capability_for()` returns the most capable set whose rails are *all*
+actually powered, falling to the most degraded rung when nothing matches. Rounds 5 and 6
+each found the engine claiming a configuration the hardware was not in -- once by
+advancing optimistically, once by leaving capability untouched after a partial shed that
+a refused rollback could not undo. Both become unrepresentable rather than separately
+guarded.
+
+The test that matters is parameterised over three port behaviours -- accepts everything,
+refuses a shed, refuses a re-power -- and asserts the same property in each:
+**capability never claims a rail that is not powered.** That is a property, not an
+instance, and it is what six rounds of instance-fixing finally produced.
+
+---
+
+### Standing after six rounds
+
+**Thirty-two findings across six rounds, all thirty-two fixed.** Suite: 249 → **399
 passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by

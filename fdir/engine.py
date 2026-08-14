@@ -48,7 +48,8 @@ from icd import (  # noqa: E402,F401
 from . import config as cfg
 from .diagnosis import Cause, Confidence, diagnose
 from .ports import RecoveryAction, RecoveryIntent
-from .degraded import LADDER, CapabilitySet, rails_to_shed, select_level, set_for_level
+from .degraded import (LADDER, CapabilitySet, capability_for, rails_to_shed,
+                       select_level, set_for_level)
 from .recovery import Campaign, CampaignState, VerifyCondition, comms_loss_ladder
 
 # Faults allowed to autonomously force NOMINAL/TEST -> SAFE. Deliberately
@@ -237,6 +238,12 @@ class FDIREngine:
         self._degrade_attempts = 0
         self._blocked_at_level: Optional[int] = None
         self._restore_pending: set = set()
+        self._shed_intended: set = set()
+        # Which rails the engine BELIEVES are powered, updated only on confirmed
+        # port results. capability is derived from this rather than asserted, so
+        # it cannot claim a configuration the hardware is not in -- the defect
+        # rounds 5 and 6 each found from a different direction.
+        self._rails_on: set = {int(r) for r in LADDER[0].rails_powered}
         # Which rails are currently over their ceiling. Read by diagnose() to
         # name the offender rather than reporting a bare "something is hot".
         self.overcurrent_rails: set = set()
@@ -275,6 +282,13 @@ class FDIREngine:
         # epoch mixed in.
         self._drift_since = None
         self._reference_samples = []
+        # In-flight rail operations do not survive a reset: the intents that
+        # would have completed them are gone. _rails_on and capability DO
+        # survive, because the rails themselves did.
+        self._shed_pending = set()
+        self._restore_pending = set()
+        self._shed_intended = set()
+        self._capability_target = None
         self._imu_history.clear()
         # A reboot destroys what we knew about every condition. Evidence of
         # clearance must be re-earned by observation, not inherited.
@@ -808,8 +822,13 @@ class FDIREngine:
         """
         if self.mode in (Mode.BOOT, Mode.SAFE):
             return
-        if self._shed_pending:
-            return              # a downgrade is already in flight
+        if self._shed_pending or self._restore_pending:
+            # Either direction in flight. Proposing a downgrade while rollback
+            # or restore POWER_ONs are still queued interleaves the two, and
+            # whichever the executor happens to drain last decides the physical
+            # outcome. Two two-phase machines sharing one intent queue must not
+            # both be live.
+            return
         want_now = select_level(self.fault_flags)
         if self._blocked_at_level is not None and want_now != self._blocked_at_level:
             # The evidence changed, so this is a NEW decision rather than a
@@ -858,7 +877,14 @@ class FDIREngine:
         # campaigns already refuse to treat an issued command as an achieved
         # outcome. Degradation had been exempt from its own architecture's rule.
         self._capability_target = target
-        self._shed_pending = set(shed)
+        self._shed_pending = set(int(r) for r in shed)
+        # What THIS attempt set out to shed. The rollback used to recompute it
+        # as rails_to_shed(self.capability, target) -- which broke the moment
+        # capability began being derived from confirmed rail state, because
+        # capability has already moved by the time a refusal arrives, and the
+        # diff then finds nothing to roll back. Remember the intent instead of
+        # re-deriving it from state the intent itself has changed.
+        self._shed_intended = set(int(r) for r in shed)
         self._degrade_attempts += 1
         self._emit(now, f"degrading [{self.capability.name} -> {target.name}]: "
                         f"shedding {[Rail(r).name for r in shed]}; "
@@ -933,6 +959,23 @@ class FDIREngine:
                 self.mode = Mode.NOMINAL
         return True
 
+    def _note_rail_state(self, now: float, rail: int, powered: bool) -> None:
+        """Record a CONFIRMED rail transition and re-derive capability from it."""
+        if powered:
+            self._rails_on.add(int(rail))
+        else:
+            self._rails_on.discard(int(rail))
+        previous = self.capability
+        self.capability = capability_for(self._rails_on)
+        if self.capability is not previous:
+            self._emit(now, f"capability now {self.capability.name} "
+                            f"(was {previous.name}); powered rails "
+                            f"{sorted(Rail(r).name for r in self._rails_on)}")
+        if self.capability.level > 0 and self.mode == Mode.NOMINAL:
+            self.mode = Mode.DEGRADED
+        elif self.capability.level == 0 and self.mode == Mode.DEGRADED:
+            self.mode = Mode.NOMINAL
+
     def note_restore_completed(self, now: float, rail: int, accepted: bool) -> None:
         """
         The executor reporting whether a rail actually came back.
@@ -941,23 +984,27 @@ class FDIREngine:
         reason it advances only in note_shed_completed() on the way down: a
         command that was issued is not a configuration that was achieved.
         """
+        # Record the physical fact FIRST, unconditionally. A confirmed port
+        # result is evidence about the hardware regardless of whether this
+        # engine happens to be tracking a restore -- and it does not, for
+        # example, after a reset cleared the in-flight bookkeeping while the
+        # queued intents survived to execute. Gating the belief on the
+        # bookkeeping made the engine UNDER-claim: capability stuck at REDUCED
+        # with every rail powered.
+        if accepted:
+            self._note_rail_state(now, rail, powered=True)
         if not self._restore_pending:
             return
         if not accepted:
             self._restore_pending.clear()
-            self._emit(now, f"capability restore FAILED: port refused to re-power "
-                            f"{Rail(rail).name}; capability remains "
-                            f"{self.capability.name}")
+            self._emit(now, f"re-power of {Rail(rail).name} REFUSED; it remains off "
+                            f"and capability stays {self.capability.name}. Powered "
+                            f"rails: {sorted(Rail(r).name for r in self._rails_on)}")
             return
         self._restore_pending.discard(int(rail))
         if self._restore_pending:
             return
-        previous = self.capability
-        self.capability = LADDER[0]
-        if self.mode == Mode.DEGRADED:
-            self.mode = Mode.NOMINAL
-        self._emit(now, f"capability restored and confirmed "
-                        f"({previous.name} -> {self.capability.name})")
+        self._emit(now, "capability restore confirmed by the executor")
 
     def _channel_trusted(self, device: Device) -> bool:
         """
@@ -1261,6 +1308,8 @@ class FDIREngine:
         is still powered, so claiming the degraded configuration would be
         claiming a physical state that does not exist.
         """
+        if accepted:
+            self._note_rail_state(now, rail, powered=False)
         if not self._shed_pending or self._capability_target is None:
             return
         if not accepted:
@@ -1270,14 +1319,20 @@ class FDIREngine:
             # Worse, the engine kept reporting FULL/NOMINAL while two of three
             # rails were physically off -- and it is the engine's claim, not the
             # truth, that reaches the ground in the telemetry packet.
-            already_shed = [r for r in rails_to_shed(self.capability, self._capability_target)
-                            if r not in self._shed_pending and int(r) != int(rail)]
+            already_shed = sorted(self._shed_intended - self._shed_pending - {int(rail)})
             for r in already_shed:
                 self.pending_intents.append(RecoveryIntent(
                     action=RecoveryAction.POWER_ON, target=Rail(r),
                     reason=f"roll back partial degrade: re-powering {Rail(r).name}",
                     requested_at=now,
                 ))
+            # TRACKED, not fire-and-forget. These POWER_ONs route to
+            # note_restore_completed, which returned early when
+            # _restore_pending was empty -- so a REFUSED rollback was invisible
+            # and the engine went on claiming a configuration two dead rails
+            # contradicted. Same shape as R5-3: one path made two-phase, the
+            # other left optimistic.
+            self._restore_pending |= {int(r) for r in already_shed}
             self._shed_pending.clear()
             rolled = f", rolling back {[Rail(r).name for r in already_shed]}" if already_shed else ""
             self._emit(now, f"degrade to {self._capability_target.name} FAILED: "
@@ -1296,14 +1351,9 @@ class FDIREngine:
         self._shed_pending.discard(int(rail))
         if self._shed_pending:
             return
-        previous = self.capability
-        self.capability = self._capability_target
         self._capability_target = None
         self._degrade_attempts = 0
-        if self.mode == Mode.NOMINAL:
-            self.mode = Mode.DEGRADED
-        self._emit(now, f"-> DEGRADED [{previous.name} -> {self.capability.name}]: "
-                        f"sheds confirmed by the executor")
+        self._emit(now, "sheds confirmed by the executor")
 
     def note_action_completed(self, now: float, accepted: bool) -> None:
         """

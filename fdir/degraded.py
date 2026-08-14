@@ -135,6 +135,28 @@ def set_for_level(level: int) -> CapabilitySet:
     return LADDER[max(0, min(level, len(LADDER) - 1))]
 
 
+def capability_for(rails_on) -> CapabilitySet:
+    """
+    The most capable set whose rails are ALL actually powered.
+
+    This is how capability stops being a claim and starts being an observation.
+    Round 5 and round 6 both found the engine asserting a configuration the
+    hardware was not in -- once by advancing optimistically, once by leaving
+    capability at FULL after a partial shed that a refused rollback could not
+    undo. Deriving the answer from what is powered makes both unrepresentable
+    rather than separately guarded.
+
+    Falls to the most degraded rung if nothing matches: a vehicle in a
+    configuration no set describes has, at best, whatever the last rung
+    promises, and over-claiming is the direction that gets acted on.
+    """
+    on = {int(r) for r in rails_on}
+    for cs in LADDER:                       # most capable first
+        if all(r in on for r in cs.rails_powered):
+            return cs
+    return LADDER[-1]
+
+
 def rails_to_shed(current: CapabilitySet, target: CapabilitySet) -> List[int]:
     """
     Rails powered in `current` and not in `target`.
