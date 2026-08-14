@@ -25,7 +25,13 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 from . import config as cfg
-from .ports import PowerPort, RecoveryAction, RecoveryIntent, ResetPort
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from icd import Rail  # noqa: E402
+
+from .ports import PowerPort, RecoveryAction, RecoveryIntent, ResetPort  # noqa: E402
 
 
 @dataclass
@@ -178,6 +184,27 @@ class RecoveryExecutor:
         # re-observed from telemetry by the engine's verification window -- the
         # port accepting a command is not evidence of anything.
         self._report(engine, completed, now, ok)
+
+    def report_rail_states(self, engine, now: float) -> None:
+        """
+        Read every rail back from the port and tell the engine what is actually true.
+
+        The engine derives capability from a BELIEF about rail power, and holds
+        no ports, so it has no way to check that belief itself. That is fine
+        while the belief is built from confirmed results -- and not fine after a
+        reboot with unreadable NVM, where the engine falls back to assuming
+        everything is on. An over-claim it cannot detect is exactly the class
+        this review keeps finding, so give it the one thing that resolves it:
+        a readback.
+
+        Called once after boot. On real hardware this is a power-good line per
+        rail, which is why PowerPort has is_enabled() at all.
+        """
+        for rail in Rail:
+            try:
+                engine.note_rail_readback(now, int(rail), bool(self._power.is_enabled(int(rail))))
+            except Exception:      # noqa: BLE001 - a port that cannot answer is not fatal
+                continue
 
     # ---- reporting ---------------------------------------------------------
 

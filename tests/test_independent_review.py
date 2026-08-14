@@ -198,7 +198,11 @@ def test_restoring_capability_does_not_skip_the_boot_sequence():
     """
     e = FDIREngine()
     e.watchdog_reset(0.0)
-    e.import_capability_state({"schema_version": 1, "level": 1}, 0.0)
+    e.import_capability_state(
+        # schema 2 persists the RAIL BELIEF, not a level derived from it --
+        # storing the level let capability and _rails_on disagree from the
+        # moment of restore. REDUCED = everything but PAYLOAD.
+        {"schema_version": 2, "rails_on": [0, 1, 2, 3]}, 0.0)
     assert e.mode == Mode.BOOT
     assert e.capability.level == 1
 
@@ -212,7 +216,11 @@ def test_mode_follows_capability_once_boot_completes():
     """
     e = FDIREngine()
     e.watchdog_reset(0.0)
-    e.import_capability_state({"schema_version": 1, "level": 1}, 0.0)
+    e.import_capability_state(
+        # schema 2 persists the RAIL BELIEF, not a level derived from it --
+        # storing the level let capability and _rails_on disagree from the
+        # moment of restore. REDUCED = everything but PAYLOAD.
+        {"schema_version": 2, "rails_on": [0, 1, 2, 3]}, 0.0)
     drive(e, 0.0, 40)
     assert e.mode == Mode.DEGRADED
     assert e.capability.level == 1

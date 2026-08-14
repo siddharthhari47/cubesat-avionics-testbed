@@ -81,6 +81,8 @@ def _load_ml_detector():
         return None
 
 from environment import SpacecraftEnvironment, FAULT_TYPES  # noqa: E402
+from hardware_sim import SimulatedPowerPort, SimulatedResetPort  # noqa: E402
+from fdir.executor import RecoveryExecutor  # noqa: E402
 from protocol import (  # noqa: E402
     AckPacket, AckStatus, CommandId, CommandPacket, FaultFlag, HealthFlag, Mode,
     TelemetryPacket, read_packet,
@@ -92,6 +94,20 @@ class Simulator:
         self.lock = threading.Lock()
         self.env = SpacecraftEnvironment(seed=seed)
         self.engine = FDIREngine()
+        # THE EXECUTOR. Round 7 found this simulator had never had one: the
+        # engine proposed RecoveryIntents into pending_intents and nothing ever
+        # drained them, so no autonomous recovery action had ever executed on
+        # the live path. Measured before the fix -- 70 s of injected radio
+        # latch-up left the rail still latched, with no campaign and no action.
+        #
+        # scenarios/runner.py wires one, which is why every measured recovery
+        # result is real; but the scenario harness is not the flight path, and
+        # the thing being demonstrated was absent from the thing being shipped.
+        # Same class as the escape hatches with no telecommand and the NVM
+        # persistence nothing called: built, tested in one harness, never wired
+        # into the real one.
+        self.executor = RecoveryExecutor(SimulatedPowerPort(self.env),
+                                         SimulatedResetPort(self.env))
         self._ml = _load_ml_detector() if use_ml else None
         if self._ml is not None:
             print("[sim] ML #1 loaded (advisory only -- no SAFE or recovery authority)")
@@ -116,6 +132,10 @@ class Simulator:
             sample, _truth = self.env.step(1.0 / self.telemetry_rate_hz)
             self.engine.tick(sample, now, ml_advisory=self._ml_advisory(sample))
             self._update_comms_loss(now)
+            # Drain the engine's proposals. Once per tick, after tick() and
+            # after the link state is known, exactly as the scenario harness
+            # does it.
+            self.executor.step(self.engine, now)
             # Cheap in V0; on hardware this becomes a wear-aware write of a
             # fixed-size record to backup SRAM, not a per-tick flash cycle.
             self._persist()
@@ -299,6 +319,10 @@ class Simulator:
             self._persist()
             self.engine.watchdog_reset(now)
             self._restore(now)
+            # Read the rails back rather than trusting the restored belief.
+            # If the NVM record was unreadable the engine has just defaulted to
+            # "everything on", which is an over-claim it cannot otherwise detect.
+            self.executor.report_rail_states(self.engine, now)
             print("[sim] simulated watchdog reset -> BOOT")
 
     def status_line(self) -> str:

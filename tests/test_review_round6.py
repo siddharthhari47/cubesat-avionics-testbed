@@ -27,7 +27,9 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "simulator"))
 
 from environment import SpacecraftEnvironment  # noqa: E402
-from fdir.degraded import FULL, LADDER, MINIMAL, REDUCED, capability_for  # noqa: E402
+from fdir.degraded import (  # noqa: E402
+    BELOW_MINIMAL, FULL, LADDER, MINIMAL, REDUCED, capability_for,
+)
 from fdir.engine import FDIREngine  # noqa: E402
 from fdir.executor import RecoveryExecutor  # noqa: E402
 from fdir.ports import RecoveryAction  # noqa: E402
@@ -120,8 +122,42 @@ def test_capability_for_never_over_claims():
     )
 
 
-def test_capability_for_falls_to_the_last_rung_when_nothing_matches():
-    assert capability_for(set()) is LADDER[-1]
+def test_capability_for_claims_nothing_when_nothing_is_satisfied():
+    """
+    ROUND 7 CORRECTED THIS TEST. It used to assert LADDER[-1] (MINIMAL), which
+    directly contradicted test_capability_for_never_over_claims sitting twelve
+    lines above it: MINIMAL claims OBC and RADIO, so returning it for a state
+    where neither is confirmed powered is an over-claim in exactly the situation
+    the vehicle can least afford one.
+
+    Two of my own tests were in tension and only the passing one was exercised,
+    because no case reached the other. That is the same failure as a scenario
+    suite whose expectations encode current behaviour rather than the
+    requirement.
+    """
+    assert capability_for(set()) is BELOW_MINIMAL
+    assert capability_for(set()).rails_powered == ()
+
+
+def test_below_minimal_claims_nothing():
+    assert BELOW_MINIMAL.rails_powered == ()
+    assert BELOW_MINIMAL.level > LADDER[-1].level
+
+
+@pytest.mark.parametrize("on", [
+    set(),
+    {Rail.OBC},
+    {Rail.RADIO},
+    {Rail.OBC, Rail.SENSORS},
+    {Rail.SENSORS, Rail.ADCS, Rail.PAYLOAD},
+])
+def test_capability_for_never_claims_an_unpowered_rail(on):
+    """The property, over every subset that fails to satisfy a rung."""
+    cs = capability_for(on)
+    claimed = {Rail(r) for r in cs.rails_powered}
+    assert not (claimed - on), (
+        f"{cs.name} claims {sorted(r.name for r in claimed - on)} which are off"
+    )
 
 
 # --- R6-1: a refused rollback was invisible --------------------------------
@@ -275,3 +311,48 @@ def test_capability_never_over_claims_under_any_port_behaviour(port_cls, seed):
     e.fault_flags |= FaultFlag.DRIFT_FROM_REFERENCE | FaultFlag.RAIL_OVERCURRENT
     spin(env, e, ex, 100)
     assert_consistent(env, e)
+
+
+# ---------------------------------------------------------------------------
+# Round 7: the live simulator had no executor at all
+# ---------------------------------------------------------------------------
+
+def test_the_live_simulator_wires_an_executor():
+    """
+    ROUND 7'S HEADLINE. run_simulator.py had never had a RecoveryExecutor. The
+    engine proposed RecoveryIntents into pending_intents and nothing drained
+    them, so no autonomous recovery action had ever executed on the live path.
+    Measured before the fix: 70 s of injected radio latch-up left the rail still
+    latched, no campaign, no action.
+
+    scenarios/runner.py wires one, which is why every measured recovery result
+    in the results doc is real -- but the scenario harness is not the flight
+    path, and the capability being demonstrated was absent from the thing being
+    shipped. Same class as escape hatches with no telecommand and persistence
+    methods nothing called: built, tested in one harness, never wired into the
+    real one.
+    """
+    import run_simulator
+
+    src = (REPO_ROOT / "simulator" / "run_simulator.py").read_text(encoding="utf-8")
+    assert "RecoveryExecutor(" in src, "the live simulator constructs no executor"
+    assert "executor.step(" in src, "the executor is constructed but never stepped"
+
+    sim = run_simulator.Simulator(telemetry_rate_hz=10, seed=5)
+    assert hasattr(sim, "executor"), "Simulator has no executor attribute"
+
+
+def test_the_engine_and_environment_share_a_time_base():
+    """
+    Found while probing the above. The engine takes `now` from the wall clock
+    while the environment advances simulated time, so any faster-than-real-time
+    run silently diverges -- 700 tight-loop ticks were under a second of engine
+    time while the environment believed 70 s had passed. The real telemetry
+    loop sleeps, so the two stay aligned in normal operation, and this test
+    pins the assumption rather than the behaviour.
+    """
+    src = (REPO_ROOT / "simulator" / "run_simulator.py").read_text(encoding="utf-8")
+    assert "time.sleep(1.0 / sim.telemetry_rate_hz)" in src, (
+        "the telemetry loop's sleep is what keeps engine time and environment "
+        "time in step; without it every duration-based detector is wrong"
+    )

@@ -39,6 +39,11 @@ states plainly what this review is and is not.
 > difference is what came out of it: **capability is now DERIVED from confirmed rail
 > state rather than asserted**, which closes the whole class rather than another
 > instance. Thirty-two findings, all fixed, **399 tests**.
+>
+> **ROUND 7 (§12) found that `run_simulator.py` had never had a `RecoveryExecutor`**
+> -- no autonomous recovery action had ever executed on the live path, only in the
+> scenario harness. Third instance of "built, tested in one harness, never wired into
+> the real one". Thirty-five findings, all fixed, **407 tests**.
 
 Six defects found, all reproduced by running code rather than by reading it. Three are
 HIGH. Two of the three are latent in V0 — they produce no wrong behaviour in the
@@ -874,9 +879,70 @@ instance, and it is what six rounds of instance-fixing finally produced.
 
 ---
 
-### Standing after six rounds
+---
 
-**Thirty-two findings across six rounds, all thirty-two fixed.** Suite: 249 → **399
+## 12. Round 7 -- the executor was never wired into the flight path
+
+The agent budget is spent (round 6's single agent returned nothing), so this round was
+probed directly. Three findings. The third is the most serious thing this review has
+found, and it was found by accident.
+
+### R7-3 (CRITICAL): `run_simulator.py` had never had a `RecoveryExecutor`
+
+The engine proposed `RecoveryIntent`s into `pending_intents` and **nothing ever drained
+them**. No autonomous recovery action had ever executed on the live path -- not once,
+since the executor was written in Phase 3.
+
+Measured before the fix: 70 s of injected radio latch-up, and the rail was still latched,
+with no campaign opened and no action taken. After wiring one line, the same injection
+gives campaign `SUCCEEDED`, latch cleared, radio responding.
+
+`scenarios/runner.py` wires an executor, which is why every measured recovery number in
+`v0-scenario-results.md` is real. But **the scenario harness is not the flight path.** The
+capability being demonstrated was absent from the thing being shipped.
+
+This is the third instance of one specific shape: **built, tested in one harness, never
+wired into the real one.** F4 found escape-hatch telecommands reachable only from a test;
+round 4 found NVM persistence methods called by nothing outside tests; this is the same
+mistake at the largest possible scale. Three instances is a pattern, and the general
+defence is a test that asserts the *production* path constructs and uses the component,
+not merely that the component works.
+
+It was found while chasing something else entirely -- I went to add a rail readback and
+the attribute I needed did not exist.
+
+### R7-1 (MEDIUM): `capability_for()` over-claimed when nothing was satisfied
+
+It returned `MINIMAL` when not even MINIMAL's rails were confirmed powered -- claiming OBC
+and RADIO on the strength of them being the least the vehicle needs. That is an
+assumption, not an observation.
+
+Worse, it **directly contradicted the property test written twelve lines above it**. Two of
+my own tests were in tension and only the passing one was ever exercised, because no case
+reached the other. Same failure as a scenario whose expectation encodes current behaviour
+rather than the requirement. `BELOW_MINIMAL` now claims nothing, and the property is
+parameterised over five unsatisfying subsets.
+
+### R7-2 (MEDIUM): capability persistence stored the derivation's output
+
+Round 6 made capability *derived* from `_rails_on`, then persisted the derived **level**.
+So restore set `capability` directly while `_rails_on` stayed at its all-on default: the
+two disagreed from the moment of restore, and the first confirmed rail operation
+afterwards re-derived from the wrong set and silently discarded what was restored.
+Schema 2 persists the rail belief -- **the input to the derivation, never its output**.
+
+### Also noted, not a flight defect
+
+The engine takes `now` from the wall clock while the environment advances simulated time.
+The real telemetry loop's `sleep` keeps them aligned, but any faster-than-real-time run
+diverges silently -- which is what made my first probe of R7-3 read as "no campaign" for
+the wrong reason. Pinned by a test on the sleep rather than left as folklore.
+
+---
+
+### Standing after seven rounds
+
+**Thirty-five findings across seven rounds, all thirty-five fixed.** Suite: 249 → **407
 passing**. Scenario suite: 15 scenarios, undetected 0/15, negative assertions clean.
 
 The section 5 prediction that an independent pass would find more was correct, and by

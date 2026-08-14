@@ -90,6 +90,21 @@ MINIMAL = CapabilitySet(
           "station can still do something",
 )
 
+# Claims nothing, because nothing is guaranteed. Reached when not even MINIMAL's
+# rails are all powered -- which should not happen, since the ladder never sheds
+# OBC or RADIO, but "should not happen" is not a property. capability_for()
+# previously returned MINIMAL in that case, which CLAIMS OBC and RADIO: an
+# over-claim in exactly the state where the vehicle can least afford one, and a
+# direct contradiction of the property test written beside it.
+BELOW_MINIMAL = CapabilitySet(
+    name="BELOW_MINIMAL", level=3,
+    rails_powered=(),
+    budget_w=0.0,
+    loses="more than any validated configuration accounts for; the vehicle is "
+          "in a state the ladder does not describe and nothing may be assumed "
+          "about what still works",
+)
+
 LADDER: Tuple[CapabilitySet, ...] = (FULL, REDUCED, MINIMAL)
 
 # The last rung keeps the radio deliberately. CSSWE is the reason: the one asset
@@ -146,15 +161,16 @@ def capability_for(rails_on) -> CapabilitySet:
     undo. Deriving the answer from what is powered makes both unrepresentable
     rather than separately guarded.
 
-    Falls to the most degraded rung if nothing matches: a vehicle in a
-    configuration no set describes has, at best, whatever the last rung
-    promises, and over-claiming is the direction that gets acted on.
+    Falls to BELOW_MINIMAL if not even the last rung is satisfied. Returning
+    MINIMAL there would claim OBC and RADIO are powered on the strength of them
+    being the least this vehicle needs -- which is an assumption, not an
+    observation, and over-claiming is the direction that gets acted on.
     """
     on = {int(r) for r in rails_on}
     for cs in LADDER:                       # most capable first
         if all(r in on for r in cs.rails_powered):
             return cs
-    return LADDER[-1]
+    return BELOW_MINIMAL
 
 
 def rails_to_shed(current: CapabilitySet, target: CapabilitySet) -> List[int]:

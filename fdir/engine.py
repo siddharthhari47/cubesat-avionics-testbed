@@ -734,21 +734,29 @@ class FDIREngine:
         powered. Exactly the class of defect the R7 reference persistence exists
         to prevent, in a second place.
         """
-        return {"schema_version": 1, "level": self.capability.level}
+        # Persist the RAIL BELIEF, not the level derived from it. Storing the
+        # level meant restore set self.capability directly while _rails_on
+        # stayed at its all-on default -- the two disagreed from the moment of
+        # restore, and the first confirmed rail operation afterwards re-derived
+        # capability from the wrong set and silently discarded what was
+        # restored. Persist the input to the derivation, never its output.
+        return {"schema_version": 2,
+                "rails_on": sorted(int(r) for r in self._rails_on)}
 
     def import_capability_state(self, state: Optional[dict], now: float) -> None:
         if not state:
             return
         try:
-            if state.get("schema_version") != 1:
+            if state.get("schema_version") != 2:
                 raise ValueError(f"unsupported capability schema {state.get('schema_version')!r}")
-            level = int(state["level"])
-            if not 0 <= level < len(LADDER):
-                raise ValueError(f"level {level} outside the ladder")
+            rails = {int(r) for r in state["rails_on"]}
+            if not rails <= {int(r) for r in Rail}:
+                raise ValueError(f"unknown rail ids in {sorted(rails)}")
         except (KeyError, TypeError, ValueError) as exc:
             self._emit(now, f"capability state discarded (unreadable: {exc})")
             return
-        self.capability = set_for_level(level)
+        self._rails_on = rails
+        self.capability = capability_for(self._rails_on)
         # Deliberately does NOT set self.mode. Writing DEGRADED here overwrote
         # BOOT, skipping the boot self-check and every warm-up gate that hangs
         # off it -- COMMS_LOSS latched on the first post-reset link report.
@@ -975,6 +983,17 @@ class FDIREngine:
             self.mode = Mode.DEGRADED
         elif self.capability.level == 0 and self.mode == Mode.DEGRADED:
             self.mode = Mode.NOMINAL
+
+    def note_rail_readback(self, now: float, rail: int, powered: bool) -> None:
+        """
+        Ground truth about a rail, read back from the port rather than inferred.
+
+        The one way the engine can correct a belief it built from something
+        other than a confirmed command -- after a reboot with unreadable NVM,
+        the belief defaults to "everything on", and nothing else could ever
+        contradict it.
+        """
+        self._note_rail_state(now, rail, powered)
 
     def note_restore_completed(self, now: float, rail: int, accepted: bool) -> None:
         """
