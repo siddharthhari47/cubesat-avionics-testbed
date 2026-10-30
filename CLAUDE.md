@@ -18,6 +18,11 @@ handled. A working demo backed by engineering evidence — not just a working de
 
 ## Current state
 
+**V1 bring-up, 30 Oct 2026:** the NUCLEO streams real telemetry at 10 Hz and
+`ground-station/serial_bridge.py` runs it through FDIR and ML #1 on the PC.
+Results and limits: `tests/v1-bench-fdir-ml-2026-10-30.md`. No FDIR runs on the
+board yet, and the text below about hardware not having arrived is out of date.
+
 **Phase: V0 complete, pre-hardware.** All six original V0 deliverables are done —
 mission statement, SRS, block and mode diagrams, telemetry/command dictionaries,
 simulator and ground station. Hardware is ordered and has not arrived, so no firmware
