@@ -246,6 +246,34 @@ typedef struct __attribute__((packed)) {
 _Static_assert(sizeof(AckPacket_t) == 10,
                "AckPacket_t must be exactly 10 bytes to match simulator/protocol.py");
 
+/* ==========================================================================
+ * CRC32 -- see the CRC32 NOTE at the top of this file for the exact variant.
+ * ======================================================================== */
+
+/**
+ * @brief CRC-32/ISO-HDLC over `length` bytes starting at `data`.
+ * Must reproduce Python's zlib.crc32() bit-for-bit -- verified against known
+ * test vectors in tests/test_firmware_crc32.py (host-side, via ctypes) before
+ * this was ever flashed to a board. See that file before touching this one.
+ */
+uint32_t tm_crc32(const uint8_t *data, uint32_t length);
+
+/* ==========================================================================
+ * Packet finalizers.
+ *
+ * Fill every field of the struct yourself EXCEPT sync, packet_id,
+ * payload_length (telemetry only), and checksum -- then call the matching
+ * finalizer, which fills those framing fields and computes the checksum in
+ * place. Because these structs are __attribute__((packed)) and this target
+ * is little-endian (Cortex-M4, matching Python's "<" struct format), the
+ * finished struct's raw bytes ARE the wire packet -- no separate
+ * serialization step, just transmit sizeof(pkt) bytes starting at &pkt.
+ * ======================================================================== */
+
+void tm_finalize_telemetry(TelemetryPacket_t *pkt);
+void tm_finalize_command(CommandPacket_t *pkt);
+void tm_finalize_ack(AckPacket_t *pkt);
+
 #ifdef __cplusplus
 }
 #endif
