@@ -26,6 +26,12 @@ it's a few thousand CubeMX-generated files that don't belong in version
 control yet, and where the real project ought to live is still an open
 decision (see below).
 
+`firmware/src/main.c`, `firmware/src/sensors.c` and `firmware/inc/sensors.h` are
+copies of the hand-written sources in `MX/`, kept here so they are in version
+control. `MX/` is still where they are built and edited, so copy them back here
+after any change. These copies are not built on their own: the HAL, startup code
+and linker script exist only in the CubeIDE project.
+
 ## Toolchain
 
 STM32CubeIDE with STM32 HAL/LL drivers — the choice already stated in the root
